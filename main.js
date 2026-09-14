@@ -205,6 +205,11 @@ class MobileDailyNotePlugin extends Plugin {
       editorCallback: function (editor) { editor.replaceSelection('\n- [ ] 📷 \n'); },
     });
 
+    // 手机桌面一键按钮：obsidian://daily-note 直接打开/创建今日笔记，
+    // 详情看设置页里「手机桌面一键按钮」那一项。
+    this.registerObsidianProtocolHandler('daily-note', this.openDailyNote.bind(this));
+    this.registerObsidianProtocolHandler('daily-todo', this.addTodoLine.bind(this));
+
     this.addSettingTab(new DailyNoteSettingTab(this.app, this));
   }
 
@@ -926,6 +931,31 @@ class DailyNoteSettingTab extends PluginSettingTab {
         return b.setButtonText('分析今日转写笔记').onClick(async function () {
           await plugin.analyzeTranscripts();
         });
+      });
+
+    containerEl.createEl('h3', { text: '手机桌面一键按钮' });
+    containerEl.createEl('p', {
+      text: '在手机系统的快捷指令里新建一个「打开 URL」动作，填下面这个地址，再添加到主屏幕，就能像 App 图标一样一点直达。'
+        + 'iOS 用自带的「快捷指令」App；Android 用支持自定义 URL 的快捷方式 App（如 Shortcut Maker）。',
+      cls: 'setting-item-description',
+    });
+
+    new Setting(containerEl)
+      .setName('打开/创建今日笔记')
+      .setDesc('选中下面这串复制走：obsidian://daily-note')
+      .addText(function (t) {
+        t.setValue('obsidian://daily-note');
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('快速记一条待办')
+      .setDesc('同上，这串是往今日笔记的待办板块里加一条：obsidian://daily-todo')
+      .addText(function (t) {
+        t.setValue('obsidian://daily-todo');
+        t.inputEl.style.width = '100%';
+        return t;
       });
 
     new Setting(containerEl)
