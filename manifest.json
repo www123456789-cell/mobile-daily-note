@@ -1,0 +1,9 @@
+{
+  "id": "mobile-daily-note",
+  "name": "每日笔记助手",
+  "version": "1.2.0",
+  "minAppVersion": "1.4.0",
+  "description": "一键创建手机端友好的每日笔记：自动日期与星期、当日课程、待添加图片占位、代办计划；并可把「AI 笔记总结」的分析直接写进课程栏。",
+  "author": "Codex",
+  "isDesktopOnly": false
+}
