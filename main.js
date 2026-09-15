@@ -48,6 +48,7 @@ const DEFAULT_SETTINGS = {
   aiPluginId: 'ai-note-summary',
   transcriptFolder: '',
   transcriptKeywords: '录音,转写,课堂,讲座',
+  transcriptExclude: '总结',
   transcriptTodayOnly: true,
   autoAnalyzeOnOpen: true,
 };
@@ -354,6 +355,17 @@ class MobileDailyNotePlugin extends Plugin {
     return normalizePath(folder ? folder + '/' + dateStr + '.md' : dateStr + '.md');
   }
 
+  // 直接查磁盘，绕过 Obsidian 的内存索引（同步刚写进来的文件可能还没被索引）
+  async existsOnDisk(path) {
+    try {
+      const adapter = this.app.vault.adapter;
+      if (adapter && typeof adapter.exists === 'function') return Boolean(await adapter.exists(path));
+    } catch (e) {
+      // 查不了就当不存在，后面还有创建后的兜底检查
+    }
+    return false;
+  }
+
   async ensureFolder(folder) {
     const parts = normalizePath(folder).split('/').filter(Boolean);
     let cur = '';
@@ -383,12 +395,23 @@ class MobileDailyNotePlugin extends Plugin {
   async ensureTodayFile() {
     const info = this.today();
     const path = this.dailyPath(info.dateStr);
-    const existing = this.app.vault.getAbstractFileByPath(path);
+    let existing = this.app.vault.getAbstractFileByPath(path);
     const self = this;
 
     if (existing && !(existing instanceof TFile)) {
       new Notice('路径被文件夹占用了：' + path);
       return null;
+    }
+
+    // 索引里没有、但磁盘上已经有了（同步刚写进来 / 索引还没刷新）：
+    // 这种情况绝不能去 create，否则 Obsidian 会因重名建出「xxx 1.md」副本。
+    if (!(existing instanceof TFile) && (await this.existsOnDisk(path))) {
+      await new Promise(function (r) { setTimeout(r, 400); });
+      existing = self.app.vault.getAbstractFileByPath(path);
+      if (!(existing instanceof TFile)) {
+        new Notice('今天的笔记其实已经存在，只是 Obsidian 还没索引到。等几秒再点一次即可，已阻止产生重复副本：' + path, 6000);
+        return null;
+      }
     }
 
     if (existing instanceof TFile) {
@@ -404,10 +427,32 @@ class MobileDailyNotePlugin extends Plugin {
     if (folder) await this.ensureFolder(folder);
     const content = await this.buildContent(info.dateStr, info.weekday);
     const file = await this.app.vault.create(path, content);
+
+    // 兜底：万一还是被 Obsidian 改名了（说明我们判断错了），把这份多余的副本删掉，
+    // 改用真正该用的那一份，避免库里越攒越多「xxx 1.md」。
+    if (normalizePath(file.path) !== normalizePath(path)) {
+      const wrongPath = file.path;
+      try {
+        await this.app.vault.delete(file, true);
+      } catch (e) {
+        console.error('[mobile-daily-note]', e);
+      }
+      const real = this.app.vault.getAbstractFileByPath(path);
+      if (real instanceof TFile) {
+        new Notice('检测到重名，已清理多余副本「' + wrongPath + '」，改用已有笔记。');
+        return { file: real, path: path, dateStr: info.dateStr, weekday: info.weekday, created: false };
+      }
+      new Notice('创建今日笔记时遇到重名冲突，请手动检查：' + wrongPath, 8000);
+      return null;
+    }
+
     return { file: file, path: path, dateStr: info.dateStr, weekday: info.weekday, created: true };
   }
 
   async openDailyNote() {
+    // 防止连点两次导致重复创建
+    if (this._opening) return;
+    this._opening = true;
     try {
       const res = await this.ensureTodayFile();
       if (!res) return;
@@ -421,6 +466,8 @@ class MobileDailyNotePlugin extends Plugin {
     } catch (e) {
       console.error('[mobile-daily-note]', e);
       new Notice('打开今日笔记失败：' + (e && e.message ? e.message : e));
+    } finally {
+      this._opening = false;
     }
   }
 
@@ -557,6 +604,17 @@ class MobileDailyNotePlugin extends Plugin {
     return keywords.some(function (k) { return hay.indexOf(k) >= 0; });
   }
 
+  // 排除项：默认把「-总结.md」这类文件排掉，免得 AI 去总结 AI 的总结
+  isExcluded(file) {
+    const words = String(this.settings.transcriptExclude || '')
+      .split(/[\n,，;；]/)
+      .map(function (k) { return k.trim().toLowerCase(); })
+      .filter(Boolean);
+    if (!words.length) return false;
+    const hay = (file.path + ' ' + file.basename).toLowerCase();
+    return words.some(function (w) { return hay.indexOf(w) >= 0; });
+  }
+
   collectTranscripts() {
     const folder = String(this.settings.transcriptFolder || '').trim().replace(/^\/+|\/+$/g, '');
     const prefix = folder ? normalizePath(folder) + '/' : '';
@@ -568,6 +626,7 @@ class MobileDailyNotePlugin extends Plugin {
       .filter(function (f) {
         if (f.path === todayPath) return false;
         if (prefix && f.path.indexOf(prefix) !== 0) return false;
+        if (self.isExcluded(f)) return false;
         if (!self.matchesTranscriptKeywords(f)) return false;
         if (self.settings.transcriptTodayOnly && !self.isTodayFile(f)) return false;
         return true;
@@ -898,6 +957,18 @@ class DailyNoteSettingTab extends PluginSettingTab {
       .addText(function (t) {
         t.setValue(s.transcriptKeywords).onChange(async function (v) {
           s.transcriptKeywords = v;
+          await plugin.saveSettings();
+        });
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('排除关键词')
+      .setDesc('文件名或路径含这些词就跳过，逗号分隔。默认「总结」——避免把已经生成的「xxx-总结.md」又送去 AI 总结一遍')
+      .addText(function (t) {
+        t.setValue(s.transcriptExclude).onChange(async function (v) {
+          s.transcriptExclude = v;
           await plugin.saveSettings();
         });
         t.inputEl.style.width = '100%';
