@@ -46,6 +46,11 @@ const DEFAULT_SETTINGS = {
   autoFixSections: true,
   // —— 与「AI 笔记总结」插件联动 ——
   aiPluginId: 'ai-note-summary',
+  // summary = 只用已有的 xxx-总结.md（不花钱）；auto = 有总结就用、没有才调 AI；ai = 总是调 AI
+  analysisSource: 'summary',
+  summarySuffix: '-总结',
+  // 已有的总结怎么写进课程栏：embed=内嵌整篇且自动同步；copy=复制正文；link=只放双链
+  summaryStyle: 'embed',
   transcriptFolder: '',
   transcriptKeywords: '录音,转写,课堂,讲座',
   transcriptExclude: '总结',
@@ -134,11 +139,20 @@ function buildAIBlock(info) {
   return [
     AI_BEGIN_PREFIX + escapeAttr(info.key) + '" hash="' + info.hash + '" -->',
     '### ' + info.title,
-    '> 来源：[[' + info.link + '|' + info.name + ']]　由 AI 生成，请核对后使用',
+    '> 来源：[[' + info.link + '|' + info.name + ']]' + (info.note ? '　' + info.note : ''),
     '',
-    String(info.summary == null ? '' : info.summary).trim(),
+    String((info.body != null ? info.body : info.summary) || '').trim(),
     AI_END_PREFIX + escapeAttr(info.key) + '" -->',
   ].join('\n');
+}
+
+// 从「AI 笔记总结」的输出文件里取出正文（去掉它自己的 frontmatter、表头和页脚）
+function extractSummaryBody(raw) {
+  let text = String(raw == null ? '' : raw).replace(/^\uFEFF/, '');
+  text = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');          // frontmatter
+  text = text.replace(/^\s*#\s[^\n]*?—\s*AI\s*总结\s*\r?\n/, '');        // 表头
+  text = text.replace(/\r?\n---\s*\r?\n\s*>\s*来源：[\s\S]*$/, '');      // 页脚
+  return text.trim();
 }
 
 // 已有该来源的分析块就原地替换，没有就追加到目标板块末尾
@@ -652,8 +666,73 @@ class MobileDailyNotePlugin extends Plugin {
     return '';
   }
 
-  // 分析单篇并写入今日笔记；返回 'analyzed' 或 'skipped'
-  async analyzeInto(todayFile, provider, file) {
+  // 找到某篇笔记对应的「xxx-总结.md」
+  async findSummaryFile(file) {
+    const suffix = String(this.settings.summarySuffix || '-总结').trim() || '-总结';
+    const folder = file.parent && file.parent.path ? file.parent.path : '';
+    const prefix = (folder ? folder + '/' : '') + file.basename + suffix;
+
+    const direct = this.app.vault.getAbstractFileByPath(normalizePath(prefix + '.md'));
+    if (direct instanceof TFile) return direct;
+
+    // 兼容重名产物「xxx-总结 1.md」，取最近修改的那一篇
+    const candidates = this.app.vault.getMarkdownFiles().filter(function (f) {
+      return f.path.indexOf(prefix + ' ') === 0 || f.path.indexOf(prefix + ' (') === 0;
+    });
+    if (!candidates.length) return null;
+    candidates.sort(function (a, b) {
+      const am = a.stat ? a.stat.mtime : 0;
+      const bm = b.stat ? b.stat.mtime : 0;
+      return bm - am;
+    });
+    return candidates[0];
+  }
+
+  // 按设置决定怎么把已有的总结放进课程栏
+  renderSummaryBody(summaryFile, raw) {
+    const style = String(this.settings.summaryStyle || 'embed');
+    const link = summaryFile.path.replace(/\.md$/i, '');
+    if (style === 'link') return '- [[' + link + '|' + summaryFile.basename + ']]';
+    if (style === 'copy') return extractSummaryBody(raw);
+    return '![[' + link + ']]';
+  }
+
+  // 处理单篇并写入今日笔记
+  // 返回 'analyzed' | 'skipped' | 'nosummary' | 'noai'
+  async processInto(todayFile, provider, file) {
+    const mode = String(this.settings.analysisSource || 'summary');
+    let summaryFile = null;
+    if (mode !== 'ai') {
+      summaryFile = await this.findSummaryFile(file);
+      if (!summaryFile && mode === 'summary') return 'nosummary';
+    }
+
+    // —— 路线 B：直接用已有的总结文件，不调用 AI ——
+    if (summaryFile) {
+      const raw = await this.app.vault.cachedRead(summaryFile);
+      // 指纹里带上呈现方式：改了「内嵌/复制/链接」也要重写已有块
+      const hash = hashText(raw + '\u0001' + String(this.settings.summaryStyle || 'embed'));
+      const current = await this.app.vault.read(todayFile);
+      if (findAIBlockHash(current, file.path) === hash) return 'skipped';
+
+      const course = this.findCourseFor(file.basename) || this.findCourseFor(summaryFile.basename);
+      const block = buildAIBlock({
+        key: file.path,
+        link: summaryFile.path.replace(/\.md$/i, ''),
+        name: summaryFile.basename,
+        hash: hash,
+        title: course ? '🤖 ' + course + ' · 总结' : '🤖 ' + summaryFile.basename,
+        note: '由 AI 生成，请核对后使用',
+        body: this.renderSummaryBody(summaryFile, raw),
+      });
+      await this.app.vault.process(todayFile, function (data) {
+        return upsertAIBlock(data, sectionByKey('courses'), file.path, block);
+      });
+      return 'analyzed';
+    }
+
+    // —— 路线 A：调用 AI 重新分析原文 ——
+    if (!provider) return 'noai';
     const raw = await this.app.vault.cachedRead(file);
     const hash = hashText(raw);
     const current = await this.app.vault.read(todayFile);
@@ -667,9 +746,9 @@ class MobileDailyNotePlugin extends Plugin {
       name: file.basename,
       hash: hash,
       title: course ? '🤖 ' + course + ' · AI 分析' : '🤖 ' + file.basename + ' · AI 分析',
-      summary: summary,
+      note: '由 AI 生成，请核对后使用',
+      body: summary,
     });
-
     await this.app.vault.process(todayFile, function (data) {
       return upsertAIBlock(data, sectionByKey('courses'), file.path, block);
     });
@@ -678,64 +757,65 @@ class MobileDailyNotePlugin extends Plugin {
 
   async runAnalysis(files, options) {
     const silent = Boolean(options && options.silent);
-    const provider = this.summaryProvider();
-    if (!provider) {
-      if (!silent) {
-        new Notice('没找到可用的「AI 笔记总结」插件（' + this.settings.aiPluginId + '）。请确认它已安装并启用。');
+    const mode = String(this.settings.analysisSource || 'summary');
+
+    // 只有需要调用 AI 的模式，才要求「AI 笔记总结」插件就绪
+    let provider = null;
+    if (mode !== 'summary') {
+      provider = this.summaryProvider();
+      if (mode === 'ai') {
+        if (!provider) {
+          if (!silent) {
+            new Notice('「分析来源」设成了「总是调用 AI」，但没找到可用的「AI 笔记总结」插件（' + this.settings.aiPluginId + '）。');
+          }
+          return;
+        }
+        if (!provider.isConfigured()) {
+          if (!silent) new Notice('「AI 笔记总结」还没填 API Key，先去它的设置里配好。');
+          return;
+        }
       }
-      return;
-    }
-    if (!provider.isConfigured()) {
-      if (!silent) new Notice('「AI 笔记总结」还没填 API Key，先去它的设置里配好。');
-      return;
     }
 
     const res = await this.ensureTodayFile();
     if (!res) return;
 
-    // 先筛一遍：内容没变过的直接跳过，既不弹提示也不花 API 的钱
-    const pending = [];
-    let skipped = 0;
-    const current = await this.app.vault.read(res.file);
-    for (let i = 0; i < files.length; i++) {
-      const raw = await this.app.vault.cachedRead(files[i]);
-      if (findAIBlockHash(current, files[i].path) === hashText(raw)) skipped++;
-      else pending.push(files[i]);
-    }
-
-    if (!pending.length) {
-      if (!silent) new Notice('没有需要分析的笔记（' + skipped + ' 篇内容没变）');
-      return;
-    }
-
-    const progress = new Notice('正在分析 ' + pending.length + ' 篇转写笔记…', 0);
+    const progress = silent ? null : new Notice('正在处理 ' + files.length + ' 篇…', 0);
     let analyzed = 0;
+    let skipped = 0;
+    let noSummary = 0;
+    let noAi = 0;
     const errors = [];
-    for (let i = 0; i < pending.length; i++) {
+    for (let i = 0; i < files.length; i++) {
       try {
-        const outcome = await this.analyzeInto(res.file, provider, pending[i]);
+        const outcome = await this.processInto(res.file, provider, files[i]);
         if (outcome === 'analyzed') analyzed++;
-        else skipped++;
+        else if (outcome === 'skipped') skipped++;
+        else if (outcome === 'nosummary') noSummary++;
+        else if (outcome === 'noai') noAi++;
       } catch (e) {
-        console.error('[mobile-daily-note]', pending[i].path, e);
-        errors.push(pending[i].basename + '：' + (e && e.message ? e.message : e));
+        console.error('[mobile-daily-note]', files[i].path, e);
+        errors.push(files[i].basename + '：' + (e && e.message ? e.message : e));
       }
     }
-    progress.hide();
+    if (progress) progress.hide();
 
     if (analyzed > 0 && this.settings.openAfterCreate) {
       await this.app.workspace.getLeaf(false).openFile(res.file);
     }
 
+    const suffix = String(this.settings.summarySuffix || '-总结').trim() || '-总结';
     const parts = [];
-    if (analyzed) parts.push('已写入 ' + analyzed + ' 篇 AI 分析');
+    if (analyzed) parts.push('已写入 ' + analyzed + ' 篇' + (mode === 'ai' ? ' AI 分析' : ''));
     if (skipped) parts.push('跳过 ' + skipped + ' 篇（内容没变）');
-    if (!analyzed && !skipped) parts.push('没有可写入的内容');
+    if (noSummary) parts.push(noSummary + ' 篇没找到对应的「' + suffix + '.md」');
+    if (noAi) parts.push(noAi + ' 篇需要调用 AI，但 AI 插件不可用');
     if (errors.length) parts.push('失败 ' + errors.length + ' 篇');
+    if (!parts.length) parts.push('没有可写入的内容');
 
     const text = parts.join('，') + (errors.length ? '\n' + errors.join('\n') : '');
     const showResult = !silent || analyzed > 0 || errors.length > 0;
-    if (showResult) new Notice(text, errors.length ? 10000 : 4000);
+    if (showResult) new Notice(text, errors.length ? 10000 : 5000);
   }
 
   async analyzeTranscripts() {
@@ -764,7 +844,8 @@ class MobileDailyNotePlugin extends Plugin {
   maybeAutoAnalyze() {
     if (!this.settings.autoAnalyzeOnOpen) return;
     if (this._autoAnalyzing) return;
-    if (!this.summaryProvider()) return;
+    // 只用已有总结的模式下不需要 AI 插件，照样可以自动写入
+    if (String(this.settings.analysisSource || 'summary') !== 'summary' && !this.summaryProvider()) return;
     const files = this.collectTranscripts();
     if (!files.length) return;
 
@@ -927,9 +1008,51 @@ class DailyNoteSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: '与「AI 笔记总结」联动' });
     containerEl.createEl('p', {
-      text: '让转写笔记的 AI 分析自动出现在「今日课程」板块里。只要「AI 笔记总结」已安装、启用并填好 API Key 即可——它保持原版就行，本插件不会改动它。',
+      text: '把转写笔记的分析放进「今日课程」板块。默认「只用已有的总结文件」，也就是拿你已经生成好的 xxx-总结.md 来用，不会重新调用 AI、不花 API 费用。',
       cls: 'setting-item-description',
     });
+
+    new Setting(containerEl)
+      .setName('分析来源')
+      .setDesc('① 只用已有的总结文件：找到 xxx-总结.md 就嵌进去，找不到就跳过，全程不调用 AI；② 优先用总结文件，没有才调用 AI；③ 总是调用 AI 重新分析原文')
+      .addDropdown(function (d) {
+        return d
+          .addOption('summary', '只用已有的总结文件（不花钱）')
+          .addOption('auto', '有总结就用，没有才调用 AI')
+          .addOption('ai', '总是调用 AI 重新分析')
+          .setValue(String(s.analysisSource || 'summary'))
+          .onChange(async function (v) {
+            s.analysisSource = v;
+            await plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('总结文件后缀')
+      .setDesc('默认 -总结，即「马原9.3一节.md」对应「马原9.3一节-总结.md」')
+      .addText(function (t) {
+        t.setValue(s.summarySuffix).onChange(async function (v) {
+          s.summarySuffix = v.trim() || '-总结';
+          await plugin.saveSettings();
+        });
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('总结的呈现方式')
+      .setDesc('内嵌整篇：用 ![[]] 把总结整篇嵌进来，总结文件改了这里会跟着变；复制正文：把正文复制进来（去掉它自己的表头和页脚），以后不再联动；只放链接：课程栏里只留一个双链')
+      .addDropdown(function (d) {
+        return d
+          .addOption('embed', '内嵌整篇（推荐，自动同步）')
+          .addOption('copy', '复制正文（独立保存）')
+          .addOption('link', '只放一个链接')
+          .setValue(String(s.summaryStyle || 'embed'))
+          .onChange(async function (v) {
+            s.summaryStyle = v;
+            await plugin.saveSettings();
+          });
+      });
 
     new Setting(containerEl)
       .setName('AI 插件 ID')
