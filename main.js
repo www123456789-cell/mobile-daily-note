@@ -5,227 +5,51 @@ const Plugin = obsidian.Plugin;
 const PluginSettingTab = obsidian.PluginSettingTab;
 const Setting = obsidian.Setting;
 const Notice = obsidian.Notice;
-const TFile = obsidian.TFile;
+const MarkdownView = obsidian.MarkdownView;
 const normalizePath = obsidian.normalizePath;
 const moment = obsidian.moment || (typeof window !== 'undefined' ? window.moment : null);
 
-const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-
-// 板块定义：title 是写进笔记的标题，keyword/aliases 用来判断“这个板块是否已经存在”。
-// 所以你可以手动把标题改成「## 今日课程」不带 emoji，插件依然认得出来。
-const SECTIONS = [
-  { key: 'courses', title: '📚 今日课程', keyword: '今日课程', aliases: ['课程'] },
-  { key: 'todos', title: '✅ 代办计划', keyword: '代办计划', aliases: ['待办计划', '待办', 'TODO'] },
-  { key: 'images', title: '🖼️ 待添加图片', keyword: '待添加图片', aliases: ['图片'] },
-  { key: 'notes', title: '📝 随手记', keyword: '随手记', aliases: ['记录'] },
-  { key: 'review', title: '🌙 今日回顾', keyword: '今日回顾', aliases: ['回顾'] },
-];
-
-function sectionByKey(key) {
-  return SECTIONS.filter(function (s) { return s.key === key; })[0];
-}
-
 const DEFAULT_SETTINGS = {
-  folder: '日记',
-  fileNameFormat: 'YYYY-MM-DD',
-  templatePath: '',
-  courses: [
-    '# 一行一天，格式 星期X: 课程1, 课程2（周一/星期一都行，多天可用逗号并列）',
-    '周一: 高等数学, 大学英语',
-    '周二: 线性代数',
-    '周三: 大学物理, 数据结构',
-    '周四: 概率论',
-    '周五: 英语口语',
-  ].join('\n'),
-  todoPresets: '复习今日课程\n完成课后作业\n整理今日笔记',
-  imageSlots: 2,
-  imageHint: '手机端：点这一行，用键盘上方的 📎 插入刚拍的照片或截图',
-  addFrontmatter: true,
-  cssClass: 'daily-mobile',
-  openAfterCreate: true,
-  autoFixSections: true,
-  // —— 与「AI 笔记总结」插件联动 ——
+  folder: '剪贴板',
+  nameFormat: 'YYYY-MM-DD HH-mm',
   aiPluginId: 'ai-note-summary',
-  // summary = 只用已有的 xxx-总结.md（不花钱）；auto = 有总结就用、没有才调 AI；ai = 总是调 AI
-  analysisSource: 'summary',
-  summarySuffix: '-总结',
-  // 已有的总结怎么写进课程栏：embed=内嵌整篇且自动同步；copy=复制正文；link=只放双链
-  summaryStyle: 'embed',
-  transcriptFolder: '',
-  transcriptKeywords: '录音,转写,课堂,讲座',
-  transcriptExclude: '总结',
-  transcriptTodayOnly: true,
-  autoAnalyzeOnOpen: true,
+  summaryPrompt: '把下面这段内容整理成简洁、准确的中文要点总结，保留关键信息与数字，不编造、不扩写。',
+  saveOriginal: true,
+  imageFolder: '剪贴板/附件',
+  imageHint: '把复制的图片粘贴到这一节',
 };
 
-// ---------- 纯函数区：不依赖 Obsidian 对象，方便单独测试 ----------
-
-function getLines(raw) {
-  return String(raw == null ? '' : raw)
-    .split('\n')
-    .map(function (l) { return l.trim(); })
-    .filter(function (l) { return l && l.charAt(0) !== '#'; });
+function pad(n) {
+  return String(n).length < 2 ? '0' + n : String(n);
 }
 
-function normalizeDay(text) {
-  return String(text == null ? '' : text).trim().replace(/^星期/, '周').replace(/\s+/g, '');
+function formatDate(d, fmt) {
+  if (moment) return moment(d).format(fmt);
+  return String(fmt)
+    .replace(/YYYY/g, String(d.getFullYear()))
+    .replace(/MM/g, pad(d.getMonth() + 1))
+    .replace(/DD/g, pad(d.getDate()))
+    .replace(/HH/g, pad(d.getHours()))
+    .replace(/mm/g, pad(d.getMinutes()))
+    .replace(/ss/g, pad(d.getSeconds()));
 }
 
-function matchesSection(line, section) {
-  const body = line.replace(/^#{1,6}\s*/, '').trim();
-  const names = [section.keyword].concat(section.aliases || []);
-  return names.some(function (n) { return body.indexOf(n) >= 0; });
-}
-
-// 在 content 的某个板块末尾插入若干行；找不到该板块时补到文末，绝不改动已有内容。
-function insertIntoSection(content, section, lines) {
-  const text = String(content == null ? '' : content);
-  const all = text.split('\n');
-
-  let start = -1;
-  for (let i = 0; i < all.length; i++) {
-    if (/^#{1,6}\s/.test(all[i]) && matchesSection(all[i], section)) {
-      start = i;
-      break;
-    }
-  }
-
-  if (start === -1) {
-    const base = text.replace(/\s*$/, '');
-    return base + '\n\n## ' + section.title + '\n' + lines.join('\n') + '\n';
-  }
-
-  let end = all.length;
-  for (let i = start + 1; i < all.length; i++) {
-    if (/^#{1,6}\s/.test(all[i])) {
-      end = i;
-      break;
-    }
-  }
-
-  let insertAt = end;
-  while (insertAt - 1 > start && all[insertAt - 1].trim() === '') insertAt--;
-
-  const next = all.slice();
-  next.splice.apply(next, [insertAt, 0].concat(lines));
-  return next.join('\n');
-}
-
-// ---------- AI 分析写回相关：同样是纯函数，方便单独测试 ----------
-
-const AI_BEGIN_PREFIX = '<!-- ans:begin source="';
-const AI_END_PREFIX = '<!-- ans:end source="';
-
-function escapeAttr(value) {
-  return String(value == null ? '' : value).replace(/"/g, '&quot;');
-}
-
-function escapeRegExp(value) {
-  return String(value == null ? '' : value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// FNV-1a 32 位：用来判断源笔记内容有没有变过，避免反复花 API 的钱
-function hashText(text) {
-  let h = 0x811c9dc5;
-  const s = String(text == null ? '' : text);
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return ('0000000' + h.toString(16)).slice(-8);
-}
-
-function buildAIBlock(info) {
-  return [
-    AI_BEGIN_PREFIX + escapeAttr(info.key) + '" hash="' + info.hash + '" -->',
-    '### ' + info.title,
-    '> 来源：[[' + info.link + '|' + info.name + ']]' + (info.note ? '　' + info.note : ''),
-    '',
-    String((info.body != null ? info.body : info.summary) || '').trim(),
-    AI_END_PREFIX + escapeAttr(info.key) + '" -->',
-  ].join('\n');
-}
-
-// 从「AI 笔记总结」的输出文件里取出正文（去掉它自己的 frontmatter、表头和页脚）
-function extractSummaryBody(raw) {
-  let text = String(raw == null ? '' : raw).replace(/^\uFEFF/, '');
-  text = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');          // frontmatter
-  text = text.replace(/^\s*#\s[^\n]*?—\s*AI\s*总结\s*\r?\n/, '');        // 表头
-  text = text.replace(/\r?\n---\s*\r?\n\s*>\s*来源：[\s\S]*$/, '');      // 页脚
-  return text.trim();
-}
-
-// 已有该来源的分析块就原地替换，没有就追加到目标板块末尾
-function upsertAIBlock(content, section, key, block) {
-  const text = String(content == null ? '' : content);
-  const beginNeedle = AI_BEGIN_PREFIX + escapeAttr(key) + '"';
-  const beginIdx = text.indexOf(beginNeedle);
-  if (beginIdx >= 0) {
-    const endNeedle = AI_END_PREFIX + escapeAttr(key) + '" -->';
-    const endIdx = text.indexOf(endNeedle, beginIdx);
-    if (endIdx >= 0) {
-      return text.slice(0, beginIdx) + block + text.slice(endIdx + endNeedle.length);
-    }
-  }
-  return insertIntoSection(text, section, block.split('\n'));
-}
-
-function findAIBlockHash(content, key) {
-  const re = new RegExp(escapeRegExp(AI_BEGIN_PREFIX + escapeAttr(key)) + '" hash="([0-9a-f]+)"');
-  const m = String(content == null ? '' : content).match(re);
-  return m ? m[1] : null;
-}
-
-// ---------- 插件本体 ----------
-
-class MobileDailyNotePlugin extends Plugin {
+class ClipboardSummaryPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addRibbonIcon('calendar-plus', '打开今日笔记', this.openDailyNote.bind(this));
+    this.addRibbonIcon('clipboard-pen', '剪贴板生成 AI 总结', this.run.bind(this));
 
     this.addCommand({
-      id: 'open-today',
-      name: '打开或创建今日笔记',
-      callback: this.openDailyNote.bind(this),
+      id: 'clipboard-to-note',
+      name: '剪贴板生成 AI 总结笔记',
+      callback: this.run.bind(this),
     });
 
-    this.addCommand({
-      id: 'add-todo',
-      name: '今日笔记：加一条待办',
-      callback: this.addTodoLine.bind(this),
-    });
+    // 手机桌面图标 / 快捷指令可以直接用这个地址，无需打开命令面板
+    this.registerObsidianProtocolHandler('clipboard', this.run.bind(this));
 
-    this.addCommand({
-      id: 'add-image-slot',
-      name: '今日笔记：在“待添加图片”加一个占位',
-      callback: this.addImageSlot.bind(this),
-    });
-
-    this.addCommand({
-      id: 'analyze-today-transcripts',
-      name: 'AI 分析今日转写笔记并写入课程栏',
-      callback: this.analyzeTranscripts.bind(this),
-    });
-
-    this.addCommand({
-      id: 'analyze-active-note-into-today',
-      name: '把当前笔记的 AI 分析写入今日课程栏',
-      callback: this.analyzeActiveNote.bind(this),
-    });
-
-    this.addCommand({
-      id: 'insert-image-placeholder',
-      name: '光标处插入图片占位',
-      editorCallback: function (editor) { editor.replaceSelection('\n- [ ] 📷 \n'); },
-    });
-
-    // 手机桌面一键按钮：obsidian://daily-note 直接打开/创建今日笔记，
-    // 详情看设置页里「手机桌面一键按钮」那一项。
-    this.registerObsidianProtocolHandler('daily-note', this.openDailyNote.bind(this));
-    this.registerObsidianProtocolHandler('daily-todo', this.addTodoLine.bind(this));
-
-    this.addSettingTab(new DailyNoteSettingTab(this.app, this));
+    this.addSettingTab(new ClipboardSummarySettingTab(this.app, this));
   }
 
   onunload() {}
@@ -238,284 +62,116 @@ class MobileDailyNotePlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  // ----- 日期与课程 -----
-
-  today() {
-    const m = moment ? moment() : null;
-    if (m) {
-      return {
-        dateStr: m.format(this.settings.fileNameFormat || 'YYYY-MM-DD'),
-        weekday: WEEKDAYS[m.day()],
-      };
+  async run() {
+    if (this._running) return;
+    this._running = true;
+    try {
+      await this.createFromClipboard();
+    } catch (e) {
+      console.error('[clipboard-summary]', e);
+      new Notice('生成失败：' + (e && e.message ? e.message : e));
+    } finally {
+      this._running = false;
     }
-    const d = new Date();
-    const pad = function (n) { return String(n).length < 2 ? '0' + n : String(n); };
-    return {
-      dateStr: d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()),
-      weekday: WEEKDAYS[d.getDay()],
-    };
   }
 
-  getCoursesFor(weekday) {
-    const day = normalizeDay(weekday);
+  // ----- 读剪贴板（能读到多少算多少）-----
+
+  async readClipboardText() {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+        return String((await navigator.clipboard.readText()) || '').trim();
+      }
+    } catch (e) {
+      // 手机系统可能禁止后台读取剪贴板
+    }
+    return '';
+  }
+
+  async readClipboardImages() {
     const out = [];
-    getLines(this.settings.courses).forEach(function (line) {
-      const idx = line.search(/[:：]/);
-      if (idx < 0) return;
-      const days = line.slice(0, idx).split(/[,，、/]/).map(normalizeDay).filter(Boolean);
-      if (days.indexOf(day) < 0) return;
-      line
-        .slice(idx + 1)
-        .split(/[,，;；、]/)
-        .map(function (c) { return c.trim(); })
-        .filter(Boolean)
-        .forEach(function (c) { out.push(c); });
-    });
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.read === 'function') {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const types = item.types || [];
+          for (const type of types) {
+            if (type.indexOf('image/') === 0) {
+              const blob = await item.getType(type);
+              const bytes = new Uint8Array(await blob.arrayBuffer());
+              out.push({ mime: type, bytes: bytes });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // 读不到图片就算了，下面会留一个手动粘贴的位置
+    }
     return out;
   }
 
-  imageSlotCount() {
-    const n = Number(this.settings.imageSlots);
-    if (!isFinite(n)) return 0;
-    return Math.max(0, Math.min(8, Math.round(n)));
+  extFor(mime) {
+    const map = {
+      'image/png': 'png',
+      'image/jpeg': 'jpg',
+      'image/webp': 'webp',
+      'image/gif': 'gif',
+      'image/heic': 'heic',
+      'image/heif': 'heif',
+    };
+    return map[mime] || 'png';
   }
 
-  todoLines() {
-    return getLines(this.settings.todoPresets);
-  }
-
-  // ----- 生成内容 -----
-
-  sectionBlocks(weekday) {
-    const courses = this.getCoursesFor(weekday);
-    const todos = this.todoLines();
-    const slots = this.imageSlotCount();
-    const self = this;
-
-    return SECTIONS.map(function (section) {
-      let body;
-      if (section.key === 'courses') {
-        body = courses.length
-          ? courses.map(function (c) { return '- [ ] ' + c; }).join('\n')
-          : '- [ ] ';
-      } else if (section.key === 'todos') {
-        body = todos
-          .map(function (t) { return '- [ ] ' + t; })
-          .concat(['- [ ] '])
-          .join('\n');
-      } else if (section.key === 'images') {
-        const lines = [];
-        if (self.settings.imageHint) lines.push('> ' + self.settings.imageHint);
-        for (let i = 0; i < slots; i++) lines.push('- [ ] 📷 ');
-        body = lines.join('\n') || '- [ ] 📷 ';
-      } else if (section.key === 'notes') {
-        body = '';
-      } else {
-        body = '- 完成：\n- 没完成：\n- 明天先做：';
-      }
-      return {
-        key: section.key,
-        text: body ? '## ' + section.title + '\n' + body : '## ' + section.title + '\n',
-      };
-    });
-  }
-
-  frontmatter(dateStr, weekday) {
-    const lines = ['---', 'date: ' + dateStr, 'weekday: ' + weekday, 'tags:', '  - 日记'];
-    if (this.settings.cssClass) lines.push('cssclasses:', '  - ' + this.settings.cssClass);
-    lines.push('---');
-    return lines.join('\n');
-  }
-
-  async readTemplate() {
-    const p = String(this.settings.templatePath || '').trim();
-    if (!p) return null;
-    const file = this.app.vault.getAbstractFileByPath(normalizePath(p));
-    if (file instanceof TFile) return await this.app.vault.read(file);
-    new Notice('模板文件没找到，已改用内置模板：' + p);
-    return null;
-  }
-
-  applyTemplate(raw, dateStr, weekday) {
-    const courses = this.getCoursesFor(weekday);
-    const todos = this.todoLines();
-    const imageBlock = this.sectionBlocks(weekday).filter(function (b) { return b.key === 'images'; })[0];
-    return String(raw)
-      .replace(/\{\{date:([^}]+)\}\}/g, function (m, fmt) {
-        return moment ? moment().format(String(fmt).trim()) : dateStr;
-      })
-      .replace(/\{\{date\}\}/g, dateStr)
-      .replace(/\{\{weekday\}\}/g, weekday)
-      .replace(/\{\{courses\}\}/g, courses.length ? courses.map(function (c) { return '- [ ] ' + c; }).join('\n') : '- [ ] ')
-      .replace(/\{\{todos\}\}/g, todos.map(function (t) { return '- [ ] ' + t; }).concat(['- [ ] ']).join('\n'))
-      .replace(/\{\{images\}\}/g, imageBlock.text.split('\n').slice(1).join('\n'));
-  }
-
-  async buildContent(dateStr, weekday) {
-    const tpl = await this.readTemplate();
-    if (tpl !== null) return this.applyTemplate(tpl, dateStr, weekday);
-
-    const parts = [];
-    if (this.settings.addFrontmatter) parts.push(this.frontmatter(dateStr, weekday));
-    parts.push('# ' + dateStr + ' ' + weekday);
-    this.sectionBlocks(weekday).forEach(function (block) { parts.push(block.text); });
-    return parts.join('\n\n') + '\n';
-  }
-
-  // ----- 文件读写 -----
-
-  dailyPath(dateStr) {
-    const folder = String(this.settings.folder || '').trim().replace(/^\/+|\/+$/g, '');
-    return normalizePath(folder ? folder + '/' + dateStr + '.md' : dateStr + '.md');
-  }
-
-  // 直接查磁盘，绕过 Obsidian 的内存索引（同步刚写进来的文件可能还没被索引）
-  async existsOnDisk(path) {
-    try {
-      const adapter = this.app.vault.adapter;
-      if (adapter && typeof adapter.exists === 'function') return Boolean(await adapter.exists(path));
-    } catch (e) {
-      // 查不了就当不存在，后面还有创建后的兜底检查
-    }
-    return false;
-  }
+  // ----- 文件工具 -----
 
   async ensureFolder(folder) {
     const parts = normalizePath(folder).split('/').filter(Boolean);
     let cur = '';
-    for (let i = 0; i < parts.length; i++) {
-      cur = cur ? cur + '/' + parts[i] : parts[i];
+    for (const part of parts) {
+      cur = cur ? cur + '/' + part : part;
       if (!this.app.vault.getAbstractFileByPath(cur)) {
         try {
           await this.app.vault.createFolder(cur);
         } catch (e) {
-          // 已存在或并发创建，忽略
+          // 并发创建 / 已存在
         }
       }
     }
   }
 
-  fillMissingSections(data, dateStr, weekday) {
-    const missing = this.sectionBlocks(weekday).filter(function (b) {
-      const section = sectionByKey(b.key);
-      const names = [section.keyword].concat(section.aliases || []);
-      return !names.some(function (n) { return String(data).indexOf(n) >= 0; });
-    });
-    if (!missing.length) return data;
-    const base = String(data).replace(/\s*$/, '');
-    return base + '\n\n' + missing.map(function (m) { return m.text; }).join('\n\n') + '\n';
+  async saveImages(images) {
+    if (!images.length) return [];
+    const folder = String(this.settings.imageFolder || '').trim().replace(/^\/+|\/+$/g, '') || '附件';
+    await this.ensureFolder(folder);
+    const stamp = formatDate(new Date(), 'YYYY-MM-DD HH-mm-ss');
+    const paths = [];
+    for (let i = 0; i < images.length; i++) {
+      const base = images.length > 1 ? stamp + ' ' + (i + 1) : stamp;
+      let p = normalizePath(folder + '/' + base + '.' + this.extFor(images[i].mime));
+      let j = 1;
+      while (this.app.vault.getAbstractFileByPath(p)) {
+        p = normalizePath(folder + '/' + base + ' ' + j + '.' + this.extFor(images[i].mime));
+        j++;
+      }
+      await this.app.vault.createBinary(p, images[i].bytes);
+      paths.push(p);
+    }
+    return paths;
   }
 
-  async ensureTodayFile() {
-    const info = this.today();
-    const path = this.dailyPath(info.dateStr);
-    let existing = this.app.vault.getAbstractFileByPath(path);
-    const self = this;
-
-    if (existing && !(existing instanceof TFile)) {
-      new Notice('路径被文件夹占用了：' + path);
-      return null;
+  async uniqueNotePath(folder, base) {
+    let p = normalizePath(folder ? folder + '/' + base + '.md' : base + '.md');
+    let i = 1;
+    while (this.app.vault.getAbstractFileByPath(p)) {
+      p = normalizePath(folder ? folder + '/' + base + ' ' + i + '.md' : base + ' ' + i + '.md');
+      i++;
     }
-
-    // 索引里没有、但磁盘上已经有了（同步刚写进来 / 索引还没刷新）：
-    // 这种情况绝不能去 create，否则 Obsidian 会因重名建出「xxx 1.md」副本。
-    if (!(existing instanceof TFile) && (await this.existsOnDisk(path))) {
-      await new Promise(function (r) { setTimeout(r, 400); });
-      existing = self.app.vault.getAbstractFileByPath(path);
-      if (!(existing instanceof TFile)) {
-        new Notice('今天的笔记其实已经存在，只是 Obsidian 还没索引到。等几秒再点一次即可，已阻止产生重复副本：' + path, 6000);
-        return null;
-      }
-    }
-
-    if (existing instanceof TFile) {
-      if (this.settings.autoFixSections) {
-        await this.app.vault.process(existing, function (data) {
-          return self.fillMissingSections(data, info.dateStr, info.weekday);
-        });
-      }
-      return { file: existing, path: path, dateStr: info.dateStr, weekday: info.weekday, created: false };
-    }
-
-    const folder = String(this.settings.folder || '').trim().replace(/^\/+|\/+$/g, '');
-    if (folder) await this.ensureFolder(folder);
-    const content = await this.buildContent(info.dateStr, info.weekday);
-    const file = await this.app.vault.create(path, content);
-
-    // 兜底：万一还是被 Obsidian 改名了（说明我们判断错了），把这份多余的副本删掉，
-    // 改用真正该用的那一份，避免库里越攒越多「xxx 1.md」。
-    if (normalizePath(file.path) !== normalizePath(path)) {
-      const wrongPath = file.path;
-      try {
-        await this.app.vault.delete(file, true);
-      } catch (e) {
-        console.error('[mobile-daily-note]', e);
-      }
-      const real = this.app.vault.getAbstractFileByPath(path);
-      if (real instanceof TFile) {
-        new Notice('检测到重名，已清理多余副本「' + wrongPath + '」，改用已有笔记。');
-        return { file: real, path: path, dateStr: info.dateStr, weekday: info.weekday, created: false };
-      }
-      new Notice('创建今日笔记时遇到重名冲突，请手动检查：' + wrongPath, 8000);
-      return null;
-    }
-
-    return { file: file, path: path, dateStr: info.dateStr, weekday: info.weekday, created: true };
+    return p;
   }
 
-  async openDailyNote() {
-    // 防止连点两次导致重复创建
-    if (this._opening) return;
-    this._opening = true;
-    try {
-      const res = await this.ensureTodayFile();
-      if (!res) return;
-      if (res.created) new Notice('已创建今日笔记：' + res.dateStr);
-      if (this.settings.openAfterCreate) {
-        await this.app.workspace.getLeaf(false).openFile(res.file);
-      } else {
-        new Notice('今日笔记已就绪：' + res.path);
-      }
-      this.maybeAutoAnalyze();
-    } catch (e) {
-      console.error('[mobile-daily-note]', e);
-      new Notice('打开今日笔记失败：' + (e && e.message ? e.message : e));
-    } finally {
-      this._opening = false;
-    }
-  }
+  // ----- 调「AI 笔记总结」插件（不改动它）-----
 
-  async insertIntoToday(key, lines) {
-    const section = sectionByKey(key);
-    try {
-      const res = await this.ensureTodayFile();
-      if (!res) return;
-      await this.app.vault.process(res.file, function (data) {
-        return insertIntoSection(data, section, lines);
-      });
-      if (this.settings.openAfterCreate) {
-        await this.app.workspace.getLeaf(false).openFile(res.file);
-      }
-      new Notice('已写入「' + section.title + '」');
-    } catch (e) {
-      console.error('[mobile-daily-note]', e);
-      new Notice('写入失败：' + (e && e.message ? e.message : e));
-    }
-  }
-
-  addTodoLine() {
-    return this.insertIntoToday('todos', ['- [ ] ']);
-  }
-
-  addImageSlot() {
-    return this.insertIntoToday('images', ['- [ ] 📷 ']);
-  }
-
-  // ----- 与「AI 笔记总结」插件联动 -----
-
-  // 找到「AI 笔记总结」插件，包装成一个统一的小接口；
-  // 全程只调用它现成的方法，不要求、也不对它做任何修改。
-  summaryProvider() {
+  aiPlugin() {
     const id = String(this.settings.aiPluginId || '').trim();
     if (!id) return null;
     let other = null;
@@ -528,343 +184,146 @@ class MobileDailyNotePlugin extends Plugin {
     } catch (e) {
       other = null;
     }
-    if (!other) return null;
+    return other;
+  }
 
-    // 路线 A：对方插件自己暴露了 api（如果有这种版本，优先用它）
-    const api = other.api;
-    if (api && typeof api.summarizeFile === 'function') {
-      return {
-        via: 'api',
-        isConfigured: function () {
-          return typeof api.isConfigured === 'function' ? Boolean(api.isConfigured()) : true;
-        },
-        summarizeFile: function (file, options) {
-          return api.summarizeFile(file, options);
-        },
-      };
+  async summarize(text) {
+    const other = this.aiPlugin();
+    const api = other && other.api;
+    if (api && typeof api.summarizeText === 'function') {
+      return await api.summarizeText(text, { systemPrompt: this.settings.summaryPrompt });
     }
-
-    // 路线 B：原版插件没有对外 api，但它实例上的 callAI + settings 是现成的，
-    // 直接按它原本的调用方式用它（截断逻辑也照它的设置来，行为保持一致）。
-    if (typeof other.callAI === 'function' && other.settings) {
-      const self = this;
-      const owner = other;
-      return {
-        via: 'callAI',
-        isConfigured: function () {
-          const s = owner.settings || {};
-          return Boolean(s.apiUrl && s.apiKey && s.model);
-        },
-        summarizeFile: async function (file, options) {
-          const raw = String((await self.app.vault.cachedRead(file)) || '').trim();
-          if (!raw) throw new Error('《' + file.name + '》是空的，没有可总结的内容');
-          const s = owner.settings || {};
-          const maxChars = Number(s.maxChars) || 0;
-          const payload = maxChars > 0 && raw.length > maxChars
-            ? raw.slice(0, maxChars) + '\n\n…（内容过长，以上已截断）'
-            : raw;
-          const summary = await owner.callAI(file.name, payload, {
-            apiUrl: s.apiUrl,
-            apiKey: s.apiKey,
-            model: s.model,
-            systemPrompt: (options && options.systemPrompt) || s.systemPrompt,
-          });
-          if (!summary) throw new Error('AI 没有返回内容，请检查它的模型配置');
-          return summary;
-        },
-      };
-    }
-
-    return null;
-  }
-
-  dateVariants(dateStr) {
-    const parts = String(dateStr).split('-');
-    if (parts.length !== 3) return [String(dateStr)];
-    const y = parts[0];
-    const mo = parts[1];
-    const d = parts[2];
-    return [
-      y + '-' + mo + '-' + d,
-      y + mo + d,
-      mo + '-' + d,
-      Number(mo) + '月' + Number(d) + '日',
-      Number(mo) + '/' + Number(d),
-    ];
-  }
-
-  isTodayFile(file) {
-    const name = String(file.basename || '');
-    const variants = this.dateVariants(this.today().dateStr);
-    for (let i = 0; i < variants.length; i++) {
-      if (name.indexOf(variants[i]) >= 0) return true;
-    }
-    const stat = file.stat;
-    if (!stat) return false;
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const from = start.getTime();
-    const to = from + 24 * 60 * 60 * 1000;
-    return (stat.mtime >= from && stat.mtime < to) || (stat.ctime >= from && stat.ctime < to);
-  }
-
-  matchesTranscriptKeywords(file) {
-    const keywords = String(this.settings.transcriptKeywords || '')
-      .split(/[\n,，;；]/)
-      .map(function (k) { return k.trim().toLowerCase(); })
-      .filter(Boolean);
-    if (!keywords.length) return true;
-    const hay = (file.path + ' ' + file.basename).toLowerCase();
-    return keywords.some(function (k) { return hay.indexOf(k) >= 0; });
-  }
-
-  // 排除项：默认把「-总结.md」这类文件排掉，免得 AI 去总结 AI 的总结
-  isExcluded(file) {
-    const words = String(this.settings.transcriptExclude || '')
-      .split(/[\n,，;；]/)
-      .map(function (k) { return k.trim().toLowerCase(); })
-      .filter(Boolean);
-    if (!words.length) return false;
-    const hay = (file.path + ' ' + file.basename).toLowerCase();
-    return words.some(function (w) { return hay.indexOf(w) >= 0; });
-  }
-
-  collectTranscripts() {
-    const folder = String(this.settings.transcriptFolder || '').trim().replace(/^\/+|\/+$/g, '');
-    const prefix = folder ? normalizePath(folder) + '/' : '';
-    const todayPath = this.dailyPath(this.today().dateStr);
-    const self = this;
-
-    return this.app.vault
-      .getMarkdownFiles()
-      .filter(function (f) {
-        if (f.path === todayPath) return false;
-        if (prefix && f.path.indexOf(prefix) !== 0) return false;
-        if (self.isExcluded(f)) return false;
-        if (!self.matchesTranscriptKeywords(f)) return false;
-        if (self.settings.transcriptTodayOnly && !self.isTodayFile(f)) return false;
-        return true;
-      })
-      .sort(function (a, b) {
-        const am = a.stat ? a.stat.mtime : 0;
-        const bm = b.stat ? b.stat.mtime : 0;
-        return am - bm;
+    if (other && typeof other.callAI === 'function' && other.settings) {
+      const s = other.settings;
+      if (!(s.apiUrl && s.apiKey && s.model)) throw new Error('「AI 笔记总结」还没配置 API Key');
+      const maxChars = Number(s.maxChars) || 0;
+      const payload = maxChars > 0 && text.length > maxChars
+        ? text.slice(0, maxChars) + '\n\n…（内容过长，已截断）'
+        : text;
+      const summary = await other.callAI('剪贴板内容', payload, {
+        apiUrl: s.apiUrl,
+        apiKey: s.apiKey,
+        model: s.model,
+        systemPrompt: this.settings.summaryPrompt || s.systemPrompt,
       });
-  }
-
-  // 笔记名里带课程名时，就把分析归到那门课下面
-  findCourseFor(name) {
-    const courses = this.getCoursesFor(this.today().weekday);
-    const target = String(name || '').toLowerCase();
-    if (!target) return '';
-    for (let i = 0; i < courses.length; i++) {
-      const course = String(courses[i]).trim();
-      if (course.length < 2) continue;
-      const key = course.toLowerCase();
-      if (target.indexOf(key) >= 0 || key.indexOf(target) >= 0) return course;
+      if (!summary) throw new Error('AI 没有返回内容');
+      return summary;
     }
-    return '';
+    throw new Error('找不到可用的「AI 笔记总结」插件');
   }
 
-  // 找到某篇笔记对应的「xxx-总结.md」
-  async findSummaryFile(file) {
-    const suffix = String(this.settings.summarySuffix || '-总结').trim() || '-总结';
-    const folder = file.parent && file.parent.path ? file.parent.path : '';
-    const prefix = (folder ? folder + '/' : '') + file.basename + suffix;
+  // ----- 主流程 -----
 
-    const direct = this.app.vault.getAbstractFileByPath(normalizePath(prefix + '.md'));
-    if (direct instanceof TFile) return direct;
-
-    // 兼容重名产物「xxx-总结 1.md」，取最近修改的那一篇
-    const candidates = this.app.vault.getMarkdownFiles().filter(function (f) {
-      return f.path.indexOf(prefix + ' ') === 0 || f.path.indexOf(prefix + ' (') === 0;
-    });
-    if (!candidates.length) return null;
-    candidates.sort(function (a, b) {
-      const am = a.stat ? a.stat.mtime : 0;
-      const bm = b.stat ? b.stat.mtime : 0;
-      return bm - am;
-    });
-    return candidates[0];
-  }
-
-  // 按设置决定怎么把已有的总结放进课程栏
-  renderSummaryBody(summaryFile, raw) {
-    const style = String(this.settings.summaryStyle || 'embed');
-    const link = summaryFile.path.replace(/\.md$/i, '');
-    if (style === 'link') return '- [[' + link + '|' + summaryFile.basename + ']]';
-    if (style === 'copy') return extractSummaryBody(raw);
-    return '![[' + link + ']]';
-  }
-
-  // 处理单篇并写入今日笔记
-  // 返回 'analyzed' | 'skipped' | 'nosummary' | 'noai'
-  async processInto(todayFile, provider, file) {
-    const mode = String(this.settings.analysisSource || 'summary');
-    let summaryFile = null;
-    if (mode !== 'ai') {
-      summaryFile = await this.findSummaryFile(file);
-      if (!summaryFile && mode === 'summary') return 'nosummary';
+  async createFromClipboard() {
+    const text = await this.readClipboardText();
+    const images = await this.readClipboardImages();
+    if (!text && !images.length) {
+      new Notice('剪贴板里没读到内容。请先复制一段文字（或图片），再点一次。');
+      return;
     }
 
-    // —— 路线 B：直接用已有的总结文件，不调用 AI ——
-    if (summaryFile) {
-      const raw = await this.app.vault.cachedRead(summaryFile);
-      // 指纹里带上呈现方式：改了「内嵌/复制/链接」也要重写已有块
-      const hash = hashText(raw + '\u0001' + String(this.settings.summaryStyle || 'embed'));
-      const current = await this.app.vault.read(todayFile);
-      if (findAIBlockHash(current, file.path) === hash) return 'skipped';
+    const title = formatDate(new Date(), this.settings.nameFormat);
+    const date = formatDate(new Date(), 'YYYY-MM-DD');
+    const folder = String(this.settings.folder || '').trim().replace(/^\/+|\/+$/g, '');
+    if (folder) await this.ensureFolder(folder);
 
-      const course = this.findCourseFor(file.basename) || this.findCourseFor(summaryFile.basename);
-      const block = buildAIBlock({
-        key: file.path,
-        link: summaryFile.path.replace(/\.md$/i, ''),
-        name: summaryFile.basename,
-        hash: hash,
-        title: course ? '🤖 ' + course + ' · 总结' : '🤖 ' + summaryFile.basename,
-        note: '由 AI 生成，请核对后使用',
-        body: this.renderSummaryBody(summaryFile, raw),
-      });
-      await this.app.vault.process(todayFile, function (data) {
-        return upsertAIBlock(data, sectionByKey('courses'), file.path, block);
-      });
-      return 'analyzed';
-    }
+    const imagePaths = await this.saveImages(images);
 
-    // —— 路线 A：调用 AI 重新分析原文 ——
-    if (!provider) return 'noai';
-    const raw = await this.app.vault.cachedRead(file);
-    const hash = hashText(raw);
-    const current = await this.app.vault.read(todayFile);
-    if (findAIBlockHash(current, file.path) === hash) return 'skipped';
-
-    const summary = await provider.summarizeFile(file, { sourceName: file.basename });
-    const course = this.findCourseFor(file.basename);
-    const block = buildAIBlock({
-      key: file.path,
-      link: file.path.replace(/\.md$/i, ''),
-      name: file.basename,
-      hash: hash,
-      title: course ? '🤖 ' + course + ' · AI 分析' : '🤖 ' + file.basename + ' · AI 分析',
-      note: '由 AI 生成，请核对后使用',
-      body: summary,
-    });
-    await this.app.vault.process(todayFile, function (data) {
-      return upsertAIBlock(data, sectionByKey('courses'), file.path, block);
-    });
-    return 'analyzed';
-  }
-
-  async runAnalysis(files, options) {
-    const silent = Boolean(options && options.silent);
-    const mode = String(this.settings.analysisSource || 'summary');
-
-    // 只有需要调用 AI 的模式，才要求「AI 笔记总结」插件就绪
-    let provider = null;
-    if (mode !== 'summary') {
-      provider = this.summaryProvider();
-      if (mode === 'ai') {
-        if (!provider) {
-          if (!silent) {
-            new Notice('「分析来源」设成了「总是调用 AI」，但没找到可用的「AI 笔记总结」插件（' + this.settings.aiPluginId + '）。');
-          }
-          return;
-        }
-        if (!provider.isConfigured()) {
-          if (!silent) new Notice('「AI 笔记总结」还没填 API Key，先去它的设置里配好。');
-          return;
-        }
-      }
-    }
-
-    const res = await this.ensureTodayFile();
-    if (!res) return;
-
-    const progress = silent ? null : new Notice('正在处理 ' + files.length + ' 篇…', 0);
-    let analyzed = 0;
-    let skipped = 0;
-    let noSummary = 0;
-    let noAi = 0;
-    const errors = [];
-    for (let i = 0; i < files.length; i++) {
+    let summary = '';
+    let summaryError = '';
+    if (text) {
       try {
-        const outcome = await this.processInto(res.file, provider, files[i]);
-        if (outcome === 'analyzed') analyzed++;
-        else if (outcome === 'skipped') skipped++;
-        else if (outcome === 'nosummary') noSummary++;
-        else if (outcome === 'noai') noAi++;
+        summary = await this.summarize(text);
       } catch (e) {
-        console.error('[mobile-daily-note]', files[i].path, e);
-        errors.push(files[i].basename + '：' + (e && e.message ? e.message : e));
+        summaryError = e && e.message ? e.message : String(e);
       }
     }
-    if (progress) progress.hide();
 
-    if (analyzed > 0 && this.settings.openAfterCreate) {
-      await this.app.workspace.getLeaf(false).openFile(res.file);
+    const lines = [];
+    lines.push('---');
+    lines.push('date: ' + date);
+    lines.push('tags:');
+    lines.push('  - 剪贴板');
+    lines.push('---');
+    lines.push('');
+    lines.push('# ' + title);
+    lines.push('');
+    if (summary) {
+      lines.push('## 🤖 AI 总结');
+      lines.push('');
+      lines.push(summary);
+      lines.push('');
+    }
+    lines.push('## 🖼️ 图片');
+    lines.push('');
+    if (imagePaths.length) {
+      imagePaths.forEach(function (p) { lines.push('![[' + p + ']]'); });
+    } else {
+      lines.push('> ' + this.settings.imageHint);
+    }
+    lines.push('');
+    if (this.settings.saveOriginal && text) {
+      lines.push('## 📄 原文');
+      lines.push('');
+      lines.push(text);
+      lines.push('');
     }
 
-    const suffix = String(this.settings.summarySuffix || '-总结').trim() || '-总结';
-    const parts = [];
-    if (analyzed) parts.push('已写入 ' + analyzed + ' 篇' + (mode === 'ai' ? ' AI 分析' : ''));
-    if (skipped) parts.push('跳过 ' + skipped + ' 篇（内容没变）');
-    if (noSummary) parts.push(noSummary + ' 篇没找到对应的「' + suffix + '.md」');
-    if (noAi) parts.push(noAi + ' 篇需要调用 AI，但 AI 插件不可用');
-    if (errors.length) parts.push('失败 ' + errors.length + ' 篇');
-    if (!parts.length) parts.push('没有可写入的内容');
+    const content = lines.join('\n');
+    const path = await this.uniqueNotePath(folder, title);
+    const file = await this.app.vault.create(path, content);
+    await this.app.workspace.getLeaf(false).openFile(file);
 
-    const text = parts.join('，') + (errors.length ? '\n' + errors.join('\n') : '');
-    const showResult = !silent || analyzed > 0 || errors.length > 0;
-    if (showResult) new Notice(text, errors.length ? 10000 : 5000);
+    // 没自动读到的图片：把光标放到「图片」节，方便长按粘贴
+    const imageLine = lines.findIndex(function (l) { return l === '## 🖼️ 图片'; });
+    if (imageLine >= 0 && !imagePaths.length) {
+      this.focusLine(file, imageLine + 2);
+    }
+
+    if (summaryError) {
+      new Notice('AI 总结没成功（' + summaryError + '）。已保存原文。', 9000);
+    } else if (!text) {
+      new Notice('剪贴板没有文字，已把图片放进新笔记。', 5000);
+    } else {
+      new Notice('已生成：' + path, 4000);
+    }
   }
 
-  async analyzeTranscripts() {
-    const files = this.collectTranscripts();
-    if (!files.length) {
-      new Notice('没匹配到转写笔记。可在设置里调整「转写笔记文件夹 / 关键词 / 只看今天的」。');
-      return;
-    }
-    await this.runAnalysis(files);
-  }
-
-  async analyzeActiveNote() {
-    const file = this.app.workspace.getActiveFile();
-    if (!file || file.extension !== 'md') {
-      new Notice('请先打开一篇 Markdown 笔记');
-      return;
-    }
-    if (file.path === this.dailyPath(this.today().dateStr)) {
-      new Notice('当前打开的就是今日笔记，换一篇转写笔记再试');
-      return;
-    }
-    await this.runAnalysis([file]);
-  }
-
-  // 打开今日笔记时顺带分析（新内容才花钱，没变就跳过）
-  maybeAutoAnalyze() {
-    if (!this.settings.autoAnalyzeOnOpen) return;
-    if (this._autoAnalyzing) return;
-    // 只用已有总结的模式下不需要 AI 插件，照样可以自动写入
-    if (String(this.settings.analysisSource || 'summary') !== 'summary' && !this.summaryProvider()) return;
-    const files = this.collectTranscripts();
-    if (!files.length) return;
-
+  focusLine(file, line) {
     const self = this;
-    this._autoAnalyzing = true;
-    (async function () {
+    setTimeout(function () {
       try {
-        await self.runAnalysis(files, { silent: true });
+        const view = self.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view || !view.file || view.file.path !== file.path) return;
+        const state = view.getState && view.getState();
+        if (state && state.mode === 'preview') {
+          state.mode = 'source';
+          const set = view.setState(state, { history: false });
+          if (set && typeof set.then === 'function') set.then(function () { self.setCursor(view, line); }).catch(function () {});
+        } else {
+          self.setCursor(view, line);
+        }
       } catch (e) {
-        console.error('[mobile-daily-note]', e);
+        // 定位失败不影响结果
       }
-      self._autoAnalyzing = false;
-    })();
+    }, 300);
+  }
+
+  setCursor(view, line) {
+    try {
+      const editor = view.editor;
+      const target = Math.min(line, Math.max(0, editor.lineCount() - 1));
+      editor.setCursor({ line: target, ch: 0 });
+      if (typeof editor.focus === 'function') editor.focus();
+    } catch (e) {
+      // 忽略
+    }
   }
 }
 
 // ---------- 设置页 ----------
 
-class DailyNoteSettingTab extends PluginSettingTab {
+class ClipboardSummarySettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -877,76 +336,78 @@ class DailyNoteSettingTab extends PluginSettingTab {
     const s = plugin.settings;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: '每日笔记助手' });
+    containerEl.createEl('h2', { text: '剪贴板摘要' });
     containerEl.createEl('p', {
-      text: '改完即时生效，不需要重启。课程表与待办默认项都是每行一条。',
+      text: '一键把剪贴板上的文字（和能读到的图片）整理成一篇带日期的 AI 总结笔记。',
       cls: 'setting-item-description',
     });
 
     new Setting(containerEl)
-      .setName('笔记存放文件夹')
-      .setDesc('留空表示库根目录；不存在会自动创建。例如：日记/2026')
+      .setName('笔记保存文件夹')
+      .setDesc('留空表示放库根目录')
       .addText(function (t) {
-        return t.setPlaceholder('日记').setValue(s.folder).onChange(async function (v) {
-          s.folder = v;
+        return t.setPlaceholder('剪贴板').setValue(s.folder).onChange(async function (v) {
+          s.folder = v.trim();
           await plugin.saveSettings();
         });
       });
 
     new Setting(containerEl)
-      .setName('文件名格式')
-      .setDesc('moment 格式，默认 YYYY-MM-DD')
+      .setName('笔记命名格式')
+      .setDesc('moment 格式，默认 YYYY-MM-DD HH-mm；同名会自动加序号')
       .addText(function (t) {
-        return t.setPlaceholder('YYYY-MM-DD').setValue(s.fileNameFormat).onChange(async function (v) {
-          s.fileNameFormat = v.trim() || 'YYYY-MM-DD';
+        return t.setPlaceholder('YYYY-MM-DD HH-mm').setValue(s.nameFormat).onChange(async function (v) {
+          s.nameFormat = v.trim() || 'YYYY-MM-DD HH-mm';
           await plugin.saveSettings();
         });
       });
 
     new Setting(containerEl)
-      .setName('一周课程表')
-      .setDesc('格式 星期X: 课程1, 课程2。某天没课就写「周三:」。以 # 开头的行会被忽略。')
-      .addTextArea(function (t) {
-        t.setValue(s.courses).onChange(async function (v) {
-          s.courses = v;
+      .setName('AI 插件 ID')
+      .setDesc('默认 ai-note-summary，一般不用改')
+      .addText(function (t) {
+        return t.setPlaceholder('ai-note-summary').setValue(s.aiPluginId).onChange(async function (v) {
+          s.aiPluginId = v.trim() || 'ai-note-summary';
           await plugin.saveSettings();
         });
-        t.inputEl.rows = 8;
-        t.inputEl.style.width = '100%';
-        t.inputEl.style.fontFamily = 'var(--font-monospace)';
-        return t;
       });
 
     new Setting(containerEl)
-      .setName('待办默认项')
-      .setDesc('每行一条，作为每天的初始待办；留空则只留一个空待办')
+      .setName('总结提示词')
+      .setDesc('决定 AI 怎么整理剪贴板内容')
       .addTextArea(function (t) {
-        t.setValue(s.todoPresets).onChange(async function (v) {
-          s.todoPresets = v;
+        t.setValue(s.summaryPrompt).onChange(async function (v) {
+          s.summaryPrompt = v;
           await plugin.saveSettings();
         });
-        t.inputEl.rows = 5;
+        t.inputEl.rows = 3;
         t.inputEl.style.width = '100%';
         return t;
       });
 
     new Setting(containerEl)
-      .setName('图片占位数量')
-      .setDesc('「待添加图片」里预生成几个空占位（0–8）')
-      .addSlider(function (sl) {
-        return sl
-          .setLimits(0, 8, 1)
-          .setValue(plugin.imageSlotCount())
-          .setDynamicTooltip()
-          .onChange(async function (v) {
-            s.imageSlots = v;
-            await plugin.saveSettings();
-          });
+      .setName('保留原文')
+      .setDesc('在笔记末尾保留剪贴板的原始文字，方便核对 AI 总结')
+      .addToggle(function (tg) {
+        return tg.setValue(!!s.saveOriginal).onChange(async function (v) {
+          s.saveOriginal = v;
+          await plugin.saveSettings();
+        });
       });
 
     new Setting(containerEl)
-      .setName('图片提示语')
-      .setDesc('写在「待添加图片」顶部的一行引用；留空则不显示')
+      .setName('图片文件夹')
+      .setDesc('从剪贴板读到的图片会存到这里')
+      .addText(function (t) {
+        return t.setPlaceholder('剪贴板/附件').setValue(s.imageFolder).onChange(async function (v) {
+          s.imageFolder = v.trim();
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('图片占位提示')
+      .setDesc('读不到剪贴板图片时，在「图片」节显示这行字提醒手动粘贴')
       .addText(function (t) {
         t.setValue(s.imageHint).onChange(async function (v) {
           s.imageHint = v;
@@ -956,212 +417,29 @@ class DailyNoteSettingTab extends PluginSettingTab {
         return t;
       });
 
-    new Setting(containerEl)
-      .setName('自定义模板文件')
-      .setDesc('可选。库内路径如 模板/日报模板.md，支持 {{date}} {{weekday}} {{courses}} {{todos}} {{images}}；留空用内置模板')
-      .addText(function (t) {
-        return t.setPlaceholder('模板/日报模板.md').setValue(s.templatePath).onChange(async function (v) {
-          s.templatePath = v.trim();
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('写入 frontmatter')
-      .setDesc('写入 date / weekday / tags，方便 Dataview 之类检索')
-      .addToggle(function (tg) {
-        return tg.setValue(!!s.addFrontmatter).onChange(async function (v) {
-          s.addFrontmatter = v;
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('CSS 类名')
-      .setDesc('写入 frontmatter 的 cssclasses，配合本插件 styles.css 优化手机端显示；留空则不加')
-      .addText(function (t) {
-        return t.setPlaceholder('daily-mobile').setValue(s.cssClass).onChange(async function (v) {
-          s.cssClass = v.trim();
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('创建后自动打开')
-      .setDesc('关闭时只在后台生成文件并弹提示')
-      .addToggle(function (tg) {
-        return tg.setValue(!!s.openAfterCreate).onChange(async function (v) {
-          s.openAfterCreate = v;
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('自动补全缺失板块')
-      .setDesc('当天笔记已存在时，只把缺的板块追加到文末，不修改你已经写好的内容')
-      .addToggle(function (tg) {
-        return tg.setValue(!!s.autoFixSections).onChange(async function (v) {
-          s.autoFixSections = v;
-          await plugin.saveSettings();
-        });
-      });
-
-    containerEl.createEl('h3', { text: '与「AI 笔记总结」联动' });
+    containerEl.createEl('h3', { text: '快捷启动（不用命令面板）' });
     containerEl.createEl('p', {
-      text: '把转写笔记的分析放进「今日课程」板块。默认「只用已有的总结文件」，也就是拿你已经生成好的 xxx-总结.md 来用，不会重新调用 AI、不花 API 费用。',
+      text: '三种方式任选：① 手机端「移动端 → 管理工具栏」里添加本插件命令；② 左侧边栏的剪贴板图标；③ 手机桌面图标——把下面这串做成「打开 URL」的快捷指令即可。',
       cls: 'setting-item-description',
     });
 
     new Setting(containerEl)
-      .setName('分析来源')
-      .setDesc('① 只用已有的总结文件：找到 xxx-总结.md 就嵌进去，找不到就跳过，全程不调用 AI；② 优先用总结文件，没有才调用 AI；③ 总是调用 AI 重新分析原文')
-      .addDropdown(function (d) {
-        return d
-          .addOption('summary', '只用已有的总结文件（不花钱）')
-          .addOption('auto', '有总结就用，没有才调用 AI')
-          .addOption('ai', '总是调用 AI 重新分析')
-          .setValue(String(s.analysisSource || 'summary'))
-          .onChange(async function (v) {
-            s.analysisSource = v;
-            await plugin.saveSettings();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName('总结文件后缀')
-      .setDesc('默认 -总结，即「马原9.3一节.md」对应「马原9.3一节-总结.md」')
+      .setName('桌面快捷指令地址')
       .addText(function (t) {
-        t.setValue(s.summarySuffix).onChange(async function (v) {
-          s.summarySuffix = v.trim() || '-总结';
-          await plugin.saveSettings();
-        });
+        t.setValue('obsidian://clipboard');
         t.inputEl.style.width = '100%';
         return t;
       });
 
     new Setting(containerEl)
-      .setName('总结的呈现方式')
-      .setDesc('内嵌整篇：用 ![[]] 把总结整篇嵌进来，总结文件改了这里会跟着变；复制正文：把正文复制进来（去掉它自己的表头和页脚），以后不再联动；只放链接：课程栏里只留一个双链')
-      .addDropdown(function (d) {
-        return d
-          .addOption('embed', '内嵌整篇（推荐，自动同步）')
-          .addOption('copy', '复制正文（独立保存）')
-          .addOption('link', '只放一个链接')
-          .setValue(String(s.summaryStyle || 'embed'))
-          .onChange(async function (v) {
-            s.summaryStyle = v;
-            await plugin.saveSettings();
-          });
-      });
-
-    new Setting(containerEl)
-      .setName('AI 插件 ID')
-      .setDesc('默认 ai-note-summary；除非你改过那个插件的 manifest id，否则不用动')
-      .addText(function (t) {
-        return t.setPlaceholder('ai-note-summary').setValue(s.aiPluginId).onChange(async function (v) {
-          s.aiPluginId = v.trim() || 'ai-note-summary';
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('转写笔记文件夹')
-      .setDesc('只在哪个文件夹里找转写笔记；留空表示在整个库里找')
-      .addText(function (t) {
-        return t.setPlaceholder('转写').setValue(s.transcriptFolder).onChange(async function (v) {
-          s.transcriptFolder = v.trim();
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('转写笔记关键词')
-      .setDesc('文件名或路径含这些词才算转写笔记，逗号分隔；留空表示不做名字过滤')
-      .addText(function (t) {
-        t.setValue(s.transcriptKeywords).onChange(async function (v) {
-          s.transcriptKeywords = v;
-          await plugin.saveSettings();
-        });
-        t.inputEl.style.width = '100%';
-        return t;
-      });
-
-    new Setting(containerEl)
-      .setName('排除关键词')
-      .setDesc('文件名或路径含这些词就跳过，逗号分隔。默认「总结」——避免把已经生成的「xxx-总结.md」又送去 AI 总结一遍')
-      .addText(function (t) {
-        t.setValue(s.transcriptExclude).onChange(async function (v) {
-          s.transcriptExclude = v;
-          await plugin.saveSettings();
-        });
-        t.inputEl.style.width = '100%';
-        return t;
-      });
-
-    new Setting(containerEl)
-      .setName('只分析今天的转写笔记')
-      .setDesc('按「文件名含今天日期」或「创建/修改时间在今天」判断；关掉会把匹配到的所有笔记都分析一遍')
-      .addToggle(function (tg) {
-        return tg.setValue(!!s.transcriptTodayOnly).onChange(async function (v) {
-          s.transcriptTodayOnly = v;
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('打开今日笔记时自动分析')
-      .setDesc('内容没变过的转写笔记会跳过，不会重复调用 API；关掉则只在手动运行命令时才分析')
-      .addToggle(function (tg) {
-        return tg.setValue(!!s.autoAnalyzeOnOpen).onChange(async function (v) {
-          s.autoAnalyzeOnOpen = v;
-          await plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName('立即分析一次')
-      .setDesc('按上面的规则扫描今天的转写笔记，把 AI 分析写进今日笔记的课程栏')
+      .setName('试用一下')
       .addButton(function (b) {
-        return b.setButtonText('分析今日转写笔记').onClick(async function () {
-          await plugin.analyzeTranscripts();
-        });
-      });
-
-    containerEl.createEl('h3', { text: '手机桌面一键按钮' });
-    containerEl.createEl('p', {
-      text: '在手机系统的快捷指令里新建一个「打开 URL」动作，填下面这个地址，再添加到主屏幕，就能像 App 图标一样一点直达。'
-        + 'iOS 用自带的「快捷指令」App；Android 用支持自定义 URL 的快捷方式 App（如 Shortcut Maker）。',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(containerEl)
-      .setName('打开/创建今日笔记')
-      .setDesc('选中下面这串复制走：obsidian://daily-note')
-      .addText(function (t) {
-        t.setValue('obsidian://daily-note');
-        t.inputEl.style.width = '100%';
-        return t;
-      });
-
-    new Setting(containerEl)
-      .setName('快速记一条待办')
-      .setDesc('同上，这串是往今日笔记的待办板块里加一条：obsidian://daily-todo')
-      .addText(function (t) {
-        t.setValue('obsidian://daily-todo');
-        t.inputEl.style.width = '100%';
-        return t;
-      });
-
-    new Setting(containerEl)
-      .setName('试一试 / 恢复默认')
-      .setDesc('先用当前设置生成今天这篇看看效果')
-      .addButton(function (b) {
-        return b.setButtonText('打开今日笔记').setCta().onClick(async function () {
-          await plugin.openDailyNote();
+        return b.setButtonText('从剪贴板生成').setCta().onClick(function () {
+          plugin.run();
         });
       })
       .addButton(function (b) {
-        return b.setButtonText('恢复默认设置').setWarning().onClick(async function () {
+        return b.setButtonText('恢复默认').setWarning().onClick(async function () {
           plugin.settings = Object.assign({}, DEFAULT_SETTINGS);
           await plugin.saveSettings();
           tab.display();
@@ -1171,4 +449,4 @@ class DailyNoteSettingTab extends PluginSettingTab {
   }
 }
 
-module.exports = MobileDailyNotePlugin;
+module.exports = ClipboardSummaryPlugin;
