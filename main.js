@@ -5,6 +5,7 @@ const Plugin = obsidian.Plugin;
 const PluginSettingTab = obsidian.PluginSettingTab;
 const Setting = obsidian.Setting;
 const Notice = obsidian.Notice;
+const TFile = obsidian.TFile;
 const MarkdownView = obsidian.MarkdownView;
 const normalizePath = obsidian.normalizePath;
 const moment = obsidian.moment || (typeof window !== 'undefined' ? window.moment : null);
@@ -12,6 +13,7 @@ const moment = obsidian.moment || (typeof window !== 'undefined' ? window.moment
 const DEFAULT_SETTINGS = {
   folder: '剪贴板',
   nameFormat: 'YYYY-MM-DD HH-mm',
+  appendToToday: true,
   aiPluginId: 'ai-note-summary',
   summaryPrompt: '把下面这段内容整理成简洁、准确的中文要点总结，保留关键信息与数字，不编造、不扩写。',
   saveOriginal: true,
@@ -32,6 +34,36 @@ function formatDate(d, fmt) {
     .replace(/HH/g, pad(d.getHours()))
     .replace(/mm/g, pad(d.getMinutes()))
     .replace(/ss/g, pad(d.getSeconds()));
+}
+
+const SECTION_ORDER = ['## 🤖 AI 总结', '## 🖼️ 图片', '## 📄 原文'];
+
+// 把 lines 追加到指定小节末尾；找不到该节就在文末补一节。
+// 只按「已知的小节标题」判断边界，所以正文里出现 ## 之类的标题也不会干扰。
+function appendToSection(content, title, lines) {
+  const all = String(content || '').split('\n');
+  let start = -1;
+  for (let i = 0; i < all.length; i++) {
+    if (all[i].trim() === title) { start = i; break; }
+  }
+
+  if (start === -1) {
+    const base = String(content || '').replace(/\s*$/, '');
+    return base + '\n\n' + title + '\n' + lines.join('\n') + '\n';
+  }
+
+  const idx = SECTION_ORDER.indexOf(title);
+  const nextTitles = idx >= 0 ? SECTION_ORDER.slice(idx + 1) : [];
+  let end = all.length;
+  for (let i = start + 1; i < all.length; i++) {
+    if (nextTitles.indexOf(all[i].trim()) >= 0) { end = i; break; }
+  }
+  let insertAt = end;
+  while (insertAt - 1 > start && all[insertAt - 1].trim() === '') insertAt--;
+
+  const next = all.slice();
+  next.splice(insertAt, 0, ...lines);
+  return next.join('\n');
 }
 
 class ClipboardSummaryPlugin extends Plugin {
@@ -222,8 +254,8 @@ class ClipboardSummaryPlugin extends Plugin {
       return;
     }
 
-    const title = formatDate(new Date(), this.settings.nameFormat);
-    const date = formatDate(new Date(), 'YYYY-MM-DD');
+    const dateKey = formatDate(new Date(), 'YYYY-MM-DD');
+    const time = formatDate(new Date(), 'HH:mm');
     const folder = String(this.settings.folder || '').trim().replace(/^\/+|\/+$/g, '');
     if (folder) await this.ensureFolder(folder);
 
@@ -239,45 +271,20 @@ class ClipboardSummaryPlugin extends Plugin {
       }
     }
 
-    const lines = [];
-    lines.push('---');
-    lines.push('date: ' + date);
-    lines.push('tags:');
-    lines.push('  - 剪贴板');
-    lines.push('---');
-    lines.push('');
-    lines.push('# ' + title);
-    lines.push('');
-    if (summary) {
-      lines.push('## 🤖 AI 总结');
-      lines.push('');
-      lines.push(summary);
-      lines.push('');
-    }
-    lines.push('## 🖼️ 图片');
-    lines.push('');
-    if (imagePaths.length) {
-      imagePaths.forEach(function (p) { lines.push('![[' + p + ']]'); });
+    let resultPath;
+    if (this.settings.appendToToday) {
+      resultPath = await this.upsertToday(dateKey, time, summary, imagePaths, text);
     } else {
-      lines.push('> ' + this.settings.imageHint);
-    }
-    lines.push('');
-    if (this.settings.saveOriginal && text) {
-      lines.push('## 📄 原文');
-      lines.push('');
-      lines.push(text);
-      lines.push('');
-    }
-
-    const content = lines.join('\n');
-    const path = await this.uniqueNotePath(folder, title);
-    const file = await this.app.vault.create(path, content);
-    await this.app.workspace.getLeaf(false).openFile(file);
-
-    // 没自动读到的图片：把光标放到「图片」节，方便长按粘贴
-    const imageLine = lines.findIndex(function (l) { return l === '## 🖼️ 图片'; });
-    if (imageLine >= 0 && !imagePaths.length) {
-      this.focusLine(file, imageLine + 2);
+      const title = formatDate(new Date(), this.settings.nameFormat);
+      const content = this.buildNote(title, dateKey, time, summary, imagePaths, text, false);
+      const path = await this.uniqueNotePath(folder, title);
+      const file = await this.app.vault.create(path, content);
+      await this.app.workspace.getLeaf(false).openFile(file);
+      if (!imagePaths.length) {
+        const imageLine = content.split('\n').findIndex(function (l) { return l === '## 🖼️ 图片'; });
+        if (imageLine >= 0) this.focusLine(file, imageLine + 2);
+      }
+      resultPath = path;
     }
 
     if (summaryError) {
@@ -285,8 +292,84 @@ class ClipboardSummaryPlugin extends Plugin {
     } else if (!text) {
       new Notice('剪贴板没有文字，已把图片放进新笔记。', 5000);
     } else {
-      new Notice('已生成：' + path, 4000);
+      new Notice(this.settings.appendToToday ? '已追加到当天笔记' : '已生成：' + resultPath, 4000);
     }
+  }
+
+  // 追加模式：一天一篇
+  async upsertToday(dateKey, time, summary, imagePaths, text) {
+    const folder = String(this.settings.folder || '').trim().replace(/^\/+|\/+$/g, '');
+    const notePath = normalizePath(folder ? folder + '/' + dateKey + '.md' : dateKey + '.md');
+    let file = this.app.vault.getAbstractFileByPath(notePath);
+
+    if (file instanceof TFile) {
+      await this.appendBlocks(file, time, summary, imagePaths, text);
+    } else {
+      if (folder) await this.ensureFolder(folder);
+      const content = this.buildNote(dateKey, dateKey, time, summary, imagePaths, text, true);
+      file = await this.app.vault.create(notePath, content);
+    }
+
+    await this.app.workspace.getLeaf(false).openFile(file);
+    if (!imagePaths.length) {
+      const current = await this.app.vault.read(file);
+      const imgLine = current.split('\n').findIndex(function (l) { return l.trim() === '## 🖼️ 图片'; });
+      if (imgLine >= 0) this.focusLine(file, imgLine + 2);
+    }
+    return notePath;
+  }
+
+  buildNote(title, dateKey, time, summary, imagePaths, text, withTime) {
+    const lines = [];
+    lines.push('---');
+    lines.push('date: ' + dateKey);
+    lines.push('tags:');
+    lines.push('  - 剪贴板');
+    lines.push('---');
+    lines.push('');
+    lines.push('# ' + title);
+    if (summary) {
+      lines.push('');
+      lines.push('## 🤖 AI 总结');
+      lines.push('');
+      if (withTime) lines.push('### ' + time, '');
+      lines.push(summary);
+    }
+    lines.push('');
+    lines.push('## 🖼️ 图片');
+    lines.push('');
+    if (imagePaths.length) {
+      imagePaths.forEach(function (p) { lines.push('![[' + p + ']]'); });
+    } else {
+      lines.push('> ' + this.settings.imageHint);
+    }
+    if (this.settings.saveOriginal && text) {
+      lines.push('');
+      lines.push('## 📄 原文');
+      lines.push('');
+      if (withTime) lines.push('### ' + time, '');
+      lines.push(text);
+    }
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  async appendBlocks(file, time, summary, imagePaths, text) {
+    const summaryLines = summary ? ['', '### ' + time, ''].concat(summary.trim().split('\n')) : null;
+    const imageLines = imagePaths.length
+      ? [''].concat(imagePaths.map(function (p) { return '![[' + p + ']]'; }))
+      : null;
+    const originalLines = (this.settings.saveOriginal && text)
+      ? ['', '### ' + time, ''].concat(text.trim().split('\n'))
+      : null;
+
+    await this.app.vault.process(file, function (data) {
+      let out = data;
+      if (summaryLines) out = appendToSection(out, '## 🤖 AI 总结', summaryLines);
+      if (imageLines) out = appendToSection(out, '## 🖼️ 图片', imageLines);
+      if (originalLines) out = appendToSection(out, '## 📄 原文', originalLines);
+      return out;
+    });
   }
 
   focusLine(file, line) {
@@ -358,6 +441,16 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
       .addText(function (t) {
         return t.setPlaceholder('YYYY-MM-DD HH-mm').setValue(s.nameFormat).onChange(async function (v) {
           s.nameFormat = v.trim() || 'YYYY-MM-DD HH-mm';
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('追加到当天笔记')
+      .setDesc('开：一天只建一篇，之后每次点按钮把新内容按时间追加进去；关：每次点按钮都新建一篇')
+      .addToggle(function (tg) {
+        return tg.setValue(!!s.appendToToday).onChange(async function (v) {
+          s.appendToToday = v;
           await plugin.saveSettings();
         });
       });
