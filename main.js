@@ -7,6 +7,7 @@ const Setting = obsidian.Setting;
 const Notice = obsidian.Notice;
 const TFile = obsidian.TFile;
 const MarkdownView = obsidian.MarkdownView;
+const requestUrl = obsidian.requestUrl;
 const normalizePath = obsidian.normalizePath;
 const moment = obsidian.moment || (typeof window !== 'undefined' ? window.moment : null);
 
@@ -19,6 +20,12 @@ const DEFAULT_SETTINGS = {
   saveOriginal: true,
   imageFolder: '剪贴板/附件',
   imageHint: '把复制的图片粘贴到这一节',
+  // 视觉模型：先识别图片成文字，再交给主模型（DeepSeek）总结
+  visionEnabled: false,
+  visionApiUrl: '',
+  visionApiKey: '',
+  visionModel: '',
+  visionPrompt: '请描述这张图片的内容，尽量提取图中的文字和关键信息，用中文输出。',
 };
 
 function pad(n) {
@@ -34,6 +41,15 @@ function formatDate(d, fmt) {
     .replace(/HH/g, pad(d.getHours()))
     .replace(/mm/g, pad(d.getMinutes()))
     .replace(/ss/g, pad(d.getSeconds()));
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 const SECTION_ORDER = ['## 🤖 AI 总结', '## 🖼️ 图片', '## 📄 原文'];
@@ -219,20 +235,69 @@ class ClipboardSummaryPlugin extends Plugin {
     return other;
   }
 
-  async summarize(text) {
+  async describeImages(images) {
+    const url = String(this.settings.visionApiUrl || '').trim();
+    const key = String(this.settings.visionApiKey || '').trim();
+    const model = String(this.settings.visionModel || '').trim();
+    if (!url || !key || !model) throw new Error('视觉模型没配全（地址 / Key / 模型）');
+
+    const content = [{ type: 'text', text: this.settings.visionPrompt || '请描述这张图片的内容。' }];
+    images.forEach(function (img) {
+      content.push({
+        type: 'image_url',
+        image_url: { url: 'data:' + img.mime + ';base64,' + bytesToBase64(img.bytes) },
+      });
+    });
+
+    const response = await requestUrl({
+      url: url,
+      method: 'POST',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + key },
+      body: JSON.stringify({
+        model: model,
+        messages: [{ role: 'user', content: content }],
+        temperature: 0.2,
+        stream: false,
+      }),
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error('视觉模型返回 HTTP ' + response.status);
+    }
+    const data = response.json;
+    const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (typeof out !== 'string' || !out.trim()) throw new Error('视觉模型没有返回文字');
+    return out.trim();
+  }
+
+  async summarize(text, images) {
+    let payload = String(text || '').trim();
+    this._visionError = '';
+
+    if (this.settings.visionEnabled && images && images.length) {
+      try {
+        const imageText = await this.describeImages(images);
+        payload = (payload ? payload + '\n\n' : '') + '以下是从图片中识别到的内容：\n' + imageText;
+      } catch (e) {
+        this._visionError = e && e.message ? e.message : String(e);
+      }
+    }
+    if (!payload) throw new Error('没有可总结的内容');
+
     const other = this.aiPlugin();
     const api = other && other.api;
     if (api && typeof api.summarizeText === 'function') {
-      return await api.summarizeText(text, { systemPrompt: this.settings.summaryPrompt });
+      return await api.summarizeText(payload, { systemPrompt: this.settings.summaryPrompt });
     }
     if (other && typeof other.callAI === 'function' && other.settings) {
       const s = other.settings;
       if (!(s.apiUrl && s.apiKey && s.model)) throw new Error('「AI 笔记总结」还没配置 API Key');
       const maxChars = Number(s.maxChars) || 0;
-      const payload = maxChars > 0 && text.length > maxChars
-        ? text.slice(0, maxChars) + '\n\n…（内容过长，已截断）'
-        : text;
-      const summary = await other.callAI('剪贴板内容', payload, {
+      const toSend = maxChars > 0 && payload.length > maxChars
+        ? payload.slice(0, maxChars) + '\n\n…（内容过长，已截断）'
+        : payload;
+      const summary = await other.callAI('剪贴板内容', toSend, {
         apiUrl: s.apiUrl,
         apiKey: s.apiKey,
         model: s.model,
@@ -263,9 +328,10 @@ class ClipboardSummaryPlugin extends Plugin {
 
     let summary = '';
     let summaryError = '';
-    if (text) {
+    const shouldSummarize = !!text || (this.settings.visionEnabled && !!images.length);
+    if (shouldSummarize) {
       try {
-        summary = await this.summarize(text);
+        summary = await this.summarize(text, images);
       } catch (e) {
         summaryError = e && e.message ? e.message : String(e);
       }
@@ -289,8 +355,10 @@ class ClipboardSummaryPlugin extends Plugin {
 
     if (summaryError) {
       new Notice('AI 总结没成功（' + summaryError + '）。已保存原文。', 9000);
+    } else if (this._visionError) {
+      new Notice('图片识别没成功（' + this._visionError + '），已只按文字总结。', 8000);
     } else if (!text) {
-      new Notice('剪贴板没有文字，已把图片放进新笔记。', 5000);
+      new Notice('已把图片内容整理进笔记。', 5000);
     } else {
       new Notice(this.settings.appendToToday ? '已追加到当天笔记' : '已生成：' + resultPath, 4000);
     }
@@ -474,6 +542,69 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
           await plugin.saveSettings();
         });
         t.inputEl.rows = 3;
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    containerEl.createEl('h3', { text: '图片识别（可选，双模型）' });
+    containerEl.createEl('p', {
+      text: '用一个视觉模型先把图片转成文字，再交给上面的主模型总结——适合你继续用 DeepSeek、只额外配一个视觉模型。',
+      cls: 'setting-item-description',
+    });
+
+    new Setting(containerEl)
+      .setName('启用图片识别')
+      .setDesc('关着时图片只保存进笔记，不参与 AI 总结')
+      .addToggle(function (tg) {
+        return tg.setValue(!!s.visionEnabled).onChange(async function (v) {
+          s.visionEnabled = v;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('视觉模型 API 地址')
+      .setDesc('例如通义：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions')
+      .addText(function (t) {
+        t.setValue(s.visionApiUrl).onChange(async function (v) {
+          s.visionApiUrl = v.trim();
+          await plugin.saveSettings();
+        });
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('视觉模型 API Key')
+      .addText(function (t) {
+        t.inputEl.type = 'password';
+        t.setValue(s.visionApiKey).onChange(async function (v) {
+          s.visionApiKey = v.trim();
+          await plugin.saveSettings();
+        });
+        t.inputEl.style.width = '100%';
+        return t;
+      });
+
+    new Setting(containerEl)
+      .setName('视觉模型名称')
+      .setDesc('例如 qwen-vl-plus')
+      .addText(function (t) {
+        return t.setPlaceholder('qwen-vl-plus').setValue(s.visionModel).onChange(async function (v) {
+          s.visionModel = v.trim();
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('视觉提示词')
+      .setDesc('让视觉模型做什么（提取文字 / 描述画面）')
+      .addTextArea(function (t) {
+        t.setValue(s.visionPrompt).onChange(async function (v) {
+          s.visionPrompt = v;
+          await plugin.saveSettings();
+        });
+        t.inputEl.rows = 2;
         t.inputEl.style.width = '100%';
         return t;
       });
