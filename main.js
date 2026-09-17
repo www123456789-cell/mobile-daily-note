@@ -52,6 +52,66 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+function base64ToBytes(b64) {
+  const bin = atob(String(b64).replace(/[\s]/g, ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// 靠文件头判断是不是图片，避免把普通文字误当成 base64
+function sniffImageMime(bytes) {
+  if (!bytes || bytes.length < 12) return '';
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return 'image/heic';
+  return '';
+}
+
+// 有些应用"复制图片"时，剪贴板的文字里其实是 data URL / 裸 base64。
+// 这里把它抠出来当图片处理，绝不把 base64 当正文发给模型。
+function extractImagesFromText(raw) {
+  let text = String(raw == null ? '' : raw);
+  const images = [];
+  const spans = [];
+
+  const re = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+(?:\r?\n[A-Za-z0-9+/=]+)*)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    try {
+      const bytes = base64ToBytes(m[2]);
+      const mime = sniffImageMime(bytes) || m[1];
+      images.push({ mime: mime, bytes: bytes });
+      spans.push([m.index, m.index + m[0].length]);
+    } catch (e) {
+      // 解不开就当作普通文字
+    }
+  }
+  for (let i = spans.length - 1; i >= 0; i--) {
+    text = text.slice(0, spans[i][0]) + ' ' + text.slice(spans[i][1]);
+  }
+  text = text.trim();
+
+  // 整段就是裸 base64（没有 data: 前缀）时，用文件头确认它确实是图片
+  if (text.length > 200 && /^[A-Za-z0-9+/\r\n]+={0,2}$/.test(text)) {
+    try {
+      const bytes = base64ToBytes(text);
+      const mime = sniffImageMime(bytes);
+      if (mime) {
+        images.push({ mime: mime, bytes: bytes });
+        text = '';
+      }
+    } catch (e) {
+      // 忽略
+    }
+  }
+
+  return { text: text, images: images };
+}
+
 const SECTION_ORDER = ['## 🤖 AI 总结', '## 🖼️ 图片', '## 📄 原文'];
 
 // 把 lines 追加到指定小节末尾；找不到该节就在文末补一节。
@@ -240,6 +300,9 @@ class ClipboardSummaryPlugin extends Plugin {
     const key = String(this.settings.visionApiKey || '').trim();
     const model = String(this.settings.visionModel || '').trim();
     if (!url || !key || !model) throw new Error('视觉模型没配全（地址 / Key / 模型）');
+    if (url.indexOf('/chat/completions') < 0) {
+      throw new Error('视觉模型地址要填 API 接口地址（一般以 /chat/completions 结尾），不能填网站首页或密钥管理页');
+    }
 
     const content = [{ type: 'text', text: this.settings.visionPrompt || '请描述这张图片的内容。' }];
     images.forEach(function (img) {
@@ -312,8 +375,12 @@ class ClipboardSummaryPlugin extends Plugin {
   // ----- 主流程 -----
 
   async createFromClipboard() {
-    const text = await this.readClipboardText();
-    const images = await this.readClipboardImages();
+    const rawText = await this.readClipboardText();
+    const fromClipboard = await this.readClipboardImages();
+    // 有些应用复制图片时，文字里带的是 base64 —— 抠出来当图片，别当正文
+    const parsed = extractImagesFromText(rawText);
+    const text = parsed.text;
+    const images = fromClipboard.concat(parsed.images);
     if (!text && !images.length) {
       new Notice('剪贴板里没读到内容。请先复制一段文字（或图片），再点一次。');
       return;
