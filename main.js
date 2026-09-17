@@ -26,6 +26,11 @@ const DEFAULT_SETTINGS = {
   visionApiKey: '',
   visionModel: '',
   visionPrompt: '请描述这张图片的内容，尽量提取图中的文字和关键信息，用中文输出。',
+  visionMaxImages: 6,
+  visionMaxSide: 1568,
+  primaryAction: 'clipboard',
+  chunkEnabled: true,
+  chunkThreshold: 12000,
 };
 
 function pad(n) {
@@ -114,6 +119,53 @@ function extractImagesFromText(raw) {
 
 const SECTION_ORDER = ['## 🤖 AI 总结', '## 🖼️ 图片', '## 📄 原文'];
 
+function stripFrontmatter(text) {
+  return String(text == null ? '' : text).replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+}
+
+// 从笔记正文里找出图片引用，正文里把它们替换成（图N），方便 AI 对上号
+function extractNoteImageRefs(content) {
+  let text = stripFrontmatter(content);
+  const refs = [];
+  const IMG = /\.(png|jpe?g|gif|webp|heic|heif|bmp|avif)$/i;
+
+  text = text.replace(/!\[\[([^\]|]+)(?:\|([^\]]*))?\]\]/g, function (m, target, alias) {
+    const t = String(target).trim();
+    if (!IMG.test(t)) return m;
+    refs.push({ target: t, alt: String(alias || '').trim() });
+    return '（图' + refs.length + '）';
+  });
+
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, target) {
+    const raw = String(target).split('|')[0].split('#')[0].split('?')[0].trim();
+    if (!IMG.test(raw)) return m;
+    let t = raw;
+    try { t = decodeURIComponent(raw); } catch (e) { /* 保持原样 */ }
+    refs.push({ target: t, alt: String(alt || '').trim() });
+    return '（图' + refs.length + '）';
+  });
+
+  return { text: text.trim(), refs: refs };
+}
+
+// 按空行切段，段落过长再硬切；用于长文本分段总结
+function splitText(text, size) {
+  const out = [];
+  let buf = '';
+  String(text == null ? '' : text).split(/\n{2,}/).forEach(function (p) {
+    if (!p) return;
+    if (p.length > size) {
+      if (buf) { out.push(buf); buf = ''; }
+      for (let i = 0; i < p.length; i += size) out.push(p.slice(i, i + size));
+      return;
+    }
+    if (buf && buf.length + p.length + 2 > size) { out.push(buf); buf = ''; }
+    buf = buf ? buf + '\n\n' + p : p;
+  });
+  if (buf) out.push(buf);
+  return out;
+}
+
 // 把 lines 追加到指定小节末尾；找不到该节就在文末补一节。
 // 只按「已知的小节标题」判断边界，所以正文里出现 ## 之类的标题也不会干扰。
 function appendToSection(content, title, lines) {
@@ -146,12 +198,18 @@ class ClipboardSummaryPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addRibbonIcon('clipboard-pen', '剪贴板生成 AI 总结', this.run.bind(this));
+    this.addRibbonIcon('clipboard-pen', '生成 AI 总结笔记', this.run.bind(this));
 
     this.addCommand({
       id: 'clipboard-to-note',
       name: '剪贴板生成 AI 总结笔记',
-      callback: this.run.bind(this),
+      callback: () => this.runSource('clipboard'),
+    });
+
+    this.addCommand({
+      id: 'active-note-to-summary',
+      name: '当前笔记生成 AI 总结（含笔记里的图片）',
+      callback: () => this.runSource('activeNote'),
     });
 
     // 手机桌面图标 / 快捷指令可以直接用这个地址，无需打开命令面板
@@ -171,10 +229,15 @@ class ClipboardSummaryPlugin extends Plugin {
   }
 
   async run() {
+    const source = String(this.settings.primaryAction || 'clipboard') === 'activeNote' ? 'activeNote' : 'clipboard';
+    return await this.runSource(source);
+  }
+
+  async runSource(source) {
     if (this._running) return;
     this._running = true;
     try {
-      await this.createFromClipboard();
+      await this.createFromSource(source);
     } catch (e) {
       console.error('[clipboard-summary]', e);
       new Notice('生成失败：' + (e && e.message ? e.message : e));
@@ -216,6 +279,47 @@ class ClipboardSummaryPlugin extends Plugin {
       // 读不到图片就算了，下面会留一个手动粘贴的位置
     }
     return out;
+  }
+
+  // ----- 当前笔记作为输入源 -----
+
+  mimeForPath(p) {
+    const ext = String(p || '').split('.').pop().toLowerCase();
+    const map = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+      gif: 'image/gif', heic: 'image/heic', heif: 'image/heif', bmp: 'image/bmp', avif: 'image/avif',
+    };
+    return map[ext] || 'image/png';
+  }
+
+  resolveImageFile(linkpath, sourcePath) {
+    try {
+      const dest = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+      if (dest instanceof TFile) return dest;
+    } catch (e) {
+      // 交给下面的兜底
+    }
+    const direct = this.app.vault.getAbstractFileByPath(normalizePath(linkpath));
+    return direct instanceof TFile ? direct : null;
+  }
+
+  async readActiveNote() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.extension !== 'md') return null;
+    const raw = await this.app.vault.cachedRead(file);
+    const parsed = extractNoteImageRefs(raw);
+    const images = [];
+    for (const ref of parsed.refs) {
+      const img = this.resolveImageFile(ref.target, file.path);
+      if (!img) continue;
+      try {
+        const buf = await this.app.vault.readBinary(img);
+        images.push({ mime: this.mimeForPath(img.path), bytes: new Uint8Array(buf), name: img.name });
+      } catch (e) {
+        // 读不出来就跳过这张
+      }
+    }
+    return { file: file, text: parsed.text, images: images };
   }
 
   extFor(mime) {
@@ -295,7 +399,28 @@ class ClipboardSummaryPlugin extends Plugin {
     return other;
   }
 
+  // 一张图一个请求：多图时不会因为请求体过大或模型只收单图而整批失败
   async describeImages(images) {
+    const maxImages = Math.max(1, Math.min(20, Number(this.settings.visionMaxImages) || 6));
+    const list = images.slice(0, maxImages);
+    const parts = [];
+    const errors = [];
+    for (let i = 0; i < list.length; i++) {
+      try {
+        const desc = await this.describeOne(list[i]);
+        if (desc) parts.push('第 ' + (i + 1) + ' 张图：\n' + desc);
+      } catch (e) {
+        errors.push('第 ' + (i + 1) + ' 张：' + (e && e.message ? e.message : String(e)));
+      }
+    }
+    this._visionPartial = errors;
+    if (!parts.length) {
+      throw new Error(errors.length ? errors.join('；') : '没有可识别的图片');
+    }
+    return parts.join('\n\n');
+  }
+
+  async describeOne(img) {
     const url = String(this.settings.visionApiUrl || '').trim();
     const key = String(this.settings.visionApiKey || '').trim();
     const model = String(this.settings.visionModel || '').trim();
@@ -304,39 +429,134 @@ class ClipboardSummaryPlugin extends Plugin {
       throw new Error('视觉模型地址要填 API 接口地址（一般以 /chat/completions 结尾），不能填网站首页或密钥管理页');
     }
 
-    const content = [{ type: 'text', text: this.settings.visionPrompt || '请描述这张图片的内容。' }];
-    images.forEach(function (img) {
-      content.push({
-        type: 'image_url',
-        image_url: { url: 'data:' + img.mime + ';base64,' + bytesToBase64(img.bytes) },
-      });
-    });
+    const small = await this.compressImage(img);
+    const content = [
+      { type: 'text', text: this.settings.visionPrompt || '请描述这张图片的内容。' },
+      { type: 'image_url', image_url: { url: 'data:' + small.mime + ';base64,' + bytesToBase64(small.bytes) } },
+    ];
 
-    const response = await requestUrl({
-      url: url,
-      method: 'POST',
-      contentType: 'application/json',
-      headers: { Authorization: 'Bearer ' + key },
-      body: JSON.stringify({
-        model: model,
-        messages: [{ role: 'user', content: content }],
-        temperature: 0.2,
-        stream: false,
-      }),
-      throw: false,
-    });
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error('视觉模型返回 HTTP ' + response.status);
+    let response;
+    try {
+      response = await requestUrl({
+        url: url,
+        method: 'POST',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + key },
+        body: JSON.stringify({
+          model: model,
+          messages: [{ role: 'user', content: content }],
+          temperature: 0.2,
+          stream: false,
+        }),
+        throw: false,
+      });
+    } catch (e) {
+      throw new Error('请求发不出去（' + (e && e.message ? e.message : String(e)) + '）');
+    }
+
+    if (!response || response.status < 200 || response.status >= 300) {
+      throw new Error('HTTP ' + (response ? response.status : '?') + this.responseDetail(response));
     }
     const data = response.json;
     const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (typeof out !== 'string' || !out.trim()) throw new Error('视觉模型没有返回文字');
+    if (typeof out !== 'string' || !out.trim()) {
+      throw new Error('返回里没有文字' + this.responseDetail(response));
+    }
     return out.trim();
+  }
+
+  // 从接口返回里抠出一小段可读的错误信息，方便定位问题
+  responseDetail(response) {
+    if (!response) return '';
+    let detail = '';
+    try {
+      detail = response.json ? JSON.stringify(response.json) : String(response.text || '');
+    } catch (e) {
+      detail = '';
+    }
+    detail = String(detail).replace(/\s+/g, ' ').slice(0, 200);
+    return detail ? '：' + detail : '';
+  }
+
+  // 发一条最小请求，验证地址 / Key / 模型名是否正确
+  async testVision() {
+    const url = String(this.settings.visionApiUrl || '').trim();
+    const key = String(this.settings.visionApiKey || '').trim();
+    const model = String(this.settings.visionModel || '').trim();
+    if (!url || !key || !model) {
+      new Notice('先把视觉模型的地址、Key、模型名都填上');
+      return;
+    }
+    if (url.indexOf('/chat/completions') < 0) {
+      new Notice('地址看着不对：应该填 API 接口地址（以 /chat/completions 结尾），不是网页', 10000);
+      return;
+    }
+    new Notice('正在测试视觉模型…', 3000);
+    try {
+      const response = await requestUrl({
+        url: url,
+        method: 'POST',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + key },
+        body: JSON.stringify({
+          model: model,
+          messages: [{ role: 'user', content: '你好，请只回复 ok' }],
+          stream: false,
+        }),
+        throw: false,
+      });
+      if (response && response.status >= 200 && response.status < 300) {
+        const out = response.json && response.json.choices && response.json.choices[0] &&
+          response.json.choices[0].message && response.json.choices[0].message.content;
+        new Notice('视觉模型连通 ✅ ' + (out ? String(out).slice(0, 40) : ''), 8000);
+      } else {
+        new Notice('视觉模型返回 HTTP ' + (response ? response.status : '?') + this.responseDetail(response), 12000);
+      }
+    } catch (e) {
+      new Notice('请求发不出去：' + (e && e.message ? e.message : String(e)), 12000);
+    }
+  }
+
+  // 发图前压缩：手机截图动辄 2MB，缩到长边 1568 + JPEG 后通常只有几百 KB
+  async compressImage(img) {
+    const maxSide = Math.max(320, Math.min(4096, Number(this.settings.visionMaxSide) || 1568));
+    if (typeof document === 'undefined' || typeof Image === 'undefined') return img;
+    let url = '';
+    try {
+      const blob = new Blob([img.bytes], { type: img.mime });
+      url = URL.createObjectURL(blob);
+      const el = await new Promise(function (resolve, reject) {
+        const i = new Image();
+        i.onload = function () { resolve(i); };
+        i.onerror = function () { reject(new Error('图片解码失败')); };
+        i.src = url;
+      });
+      const w = el.naturalWidth || el.width;
+      const h = el.naturalHeight || el.height;
+      const scale = Math.min(1, maxSide / Math.max(w, h));
+      if (scale >= 1 && img.bytes.length < 400 * 1024) {
+        URL.revokeObjectURL(url);
+        return img;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      canvas.getContext('2d').drawImage(el, 0, 0, canvas.width, canvas.height);
+      const outBlob = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/jpeg', 0.85); });
+      URL.revokeObjectURL(url);
+      if (!outBlob) return img;
+      const buf = new Uint8Array(await outBlob.arrayBuffer());
+      return { mime: 'image/jpeg', bytes: buf };
+    } catch (e) {
+      if (url) { try { URL.revokeObjectURL(url); } catch (e2) { /* 忽略 */ } }
+      return img;
+    }
   }
 
   async summarize(text, images) {
     let payload = String(text || '').trim();
     this._visionError = '';
+    this._visionPartial = [];
 
     if (this.settings.visionEnabled && images && images.length) {
       try {
@@ -348,6 +568,11 @@ class ClipboardSummaryPlugin extends Plugin {
     }
     if (!payload) throw new Error('没有可总结的内容');
 
+    return await this.summarizePayload(payload);
+  }
+
+  // 交给主模型（AI 笔记总结插件）出总结
+  async callPrimary(payload) {
     const other = this.aiPlugin();
     const api = other && other.api;
     if (api && typeof api.summarizeText === 'function') {
@@ -372,18 +597,59 @@ class ClipboardSummaryPlugin extends Plugin {
     throw new Error('找不到可用的「AI 笔记总结」插件');
   }
 
+  // 长文本：先分段各自总结，再合并成一份，避免被静默截断
+  async summarizePayload(payload) {
+    const enabled = this.settings.chunkEnabled !== false;
+    const threshold = Math.max(2000, Number(this.settings.chunkThreshold) || 12000);
+    if (!enabled || payload.length <= threshold) return await this.callPrimary(payload);
+
+    const chunkSize = Math.max(1500, Math.floor(threshold * 0.7));
+    const chunks = splitText(payload, chunkSize);
+    if (chunks.length <= 1) return await this.callPrimary(payload);
+
+    const parts = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const prefix = '下面是一份长材料的第 ' + (i + 1) + '/' + chunks.length + ' 段，请只总结这一段：\n\n';
+      parts.push(await this.callPrimary(prefix + chunks[i]));
+    }
+    const merged = parts.join('\n\n');
+    if (merged.length <= threshold) {
+      return await this.callPrimary(
+        '下面是对同一份材料分段做的总结，请合并成一份整体总结：去掉重复，保留全部关键信息与数字，不要丢内容。\n\n' + merged
+      );
+    }
+    return merged;
+  }
+
   // ----- 主流程 -----
 
-  async createFromClipboard() {
-    const rawText = await this.readClipboardText();
-    const fromClipboard = await this.readClipboardImages();
-    // 有些应用复制图片时，文字里带的是 base64 —— 抠出来当图片，别当正文
-    const parsed = extractImagesFromText(rawText);
-    const text = parsed.text;
-    const images = fromClipboard.concat(parsed.images);
-    if (!text && !images.length) {
-      new Notice('剪贴板里没读到内容。请先复制一段文字（或图片），再点一次。');
-      return;
+  async createFromSource(source) {
+    let text = '';
+    let images = [];
+
+    if (source === 'activeNote') {
+      const note = await this.readActiveNote();
+      if (!note) {
+        new Notice('请先打开一篇 Markdown 笔记，再点这个。');
+        return;
+      }
+      text = note.text;
+      images = note.images;
+      if (!text && !images.length) {
+        new Notice('这篇笔记里没有可总结的文字或图片。');
+        return;
+      }
+    } else {
+      const rawText = await this.readClipboardText();
+      const fromClipboard = await this.readClipboardImages();
+      // 有些应用复制图片时，文字里带的是 base64 —— 抠出来当图片，别当正文
+      const parsed = extractImagesFromText(rawText);
+      text = parsed.text;
+      images = fromClipboard.concat(parsed.images);
+      if (!text && !images.length) {
+        new Notice('剪贴板里没读到内容。请先复制一段文字（或图片），再点一次。');
+        return;
+      }
     }
 
     const dateKey = formatDate(new Date(), 'YYYY-MM-DD');
@@ -424,6 +690,8 @@ class ClipboardSummaryPlugin extends Plugin {
       new Notice('AI 总结没成功（' + summaryError + '）。已保存原文。', 9000);
     } else if (this._visionError) {
       new Notice('图片识别没成功（' + this._visionError + '），已只按文字总结。', 8000);
+    } else if (this._visionPartial && this._visionPartial.length) {
+      new Notice('部分图片没识别成功（' + this._visionPartial.join('；') + '），其余已写入。', 9000);
     } else if (!text) {
       new Notice('已把图片内容整理进笔记。', 5000);
     } else {
@@ -554,11 +822,26 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
     const s = plugin.settings;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: '剪贴板摘要' });
+    const ver = plugin.manifest && plugin.manifest.version ? plugin.manifest.version : '?';
+    containerEl.createEl('h2', { text: '剪贴板摘要 v' + ver });
     containerEl.createEl('p', {
-      text: '一键把剪贴板上的文字（和能读到的图片）整理成一篇带日期的 AI 总结笔记。',
+      text: '把剪贴板、或当前笔记里的文字和图片，整理成一篇带日期的 AI 总结笔记。',
       cls: 'setting-item-description',
     });
+
+    new Setting(containerEl)
+      .setName('侧边栏图标 / 桌面快捷指令 触发的动作')
+      .setDesc('命令面板里两个动作都有，这里决定图标和 obsidian://clipboard 用哪个')
+      .addDropdown(function (d) {
+        return d
+          .addOption('clipboard', '读剪贴板')
+          .addOption('activeNote', '读当前打开的笔记（含笔记里的图片）')
+          .setValue(String(s.primaryAction || 'clipboard'))
+          .onChange(async function (v) {
+            s.primaryAction = v;
+            await plugin.saveSettings();
+          });
+      });
 
     new Setting(containerEl)
       .setName('笔记保存文件夹')
@@ -677,6 +960,50 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName('一次最多识别几张')
+      .setDesc('默认 6。图片是一张一张发的，多图不会互相拖累')
+      .addText(function (t) {
+        return t.setPlaceholder('6').setValue(String(s.visionMaxImages)).onChange(async function (v) {
+          const n = Number(v);
+          s.visionMaxImages = Number.isFinite(n) && n > 0 ? Math.min(20, Math.round(n)) : 6;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('发图前压缩到长边多少像素')
+      .setDesc('默认 1568。手机截图动辄 2MB，压缩后通常只剩几百 KB，更快也更不容易失败')
+      .addText(function (t) {
+        return t.setPlaceholder('1568').setValue(String(s.visionMaxSide)).onChange(async function (v) {
+          const n = Number(v);
+          s.visionMaxSide = Number.isFinite(n) && n >= 320 ? Math.min(4096, Math.round(n)) : 1568;
+          await plugin.saveSettings();
+        });
+      });
+
+    containerEl.createEl('h3', { text: '长文本' });
+    new Setting(containerEl)
+      .setName('长文本分段总结')
+      .setDesc('内容太长时先分段各自总结、再合并成一份，避免被接口静默截断')
+      .addToggle(function (tg) {
+        return tg.setValue(s.chunkEnabled !== false).onChange(async function (v) {
+          s.chunkEnabled = v;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('超过多少字开始分段')
+      .setDesc('默认 12000')
+      .addText(function (t) {
+        return t.setPlaceholder('12000').setValue(String(s.chunkThreshold)).onChange(async function (v) {
+          const n = Number(v);
+          s.chunkThreshold = Number.isFinite(n) && n >= 2000 ? Math.round(n) : 12000;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
       .setName('保留原文')
       .setDesc('在笔记末尾保留剪贴板的原始文字，方便核对 AI 总结')
       .addToggle(function (tg) {
@@ -726,7 +1053,17 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
       .setName('试用一下')
       .addButton(function (b) {
         return b.setButtonText('从剪贴板生成').setCta().onClick(function () {
-          plugin.run();
+          plugin.runSource('clipboard');
+        });
+      })
+      .addButton(function (b) {
+        return b.setButtonText('处理当前笔记').onClick(function () {
+          plugin.runSource('activeNote');
+        });
+      })
+      .addButton(function (b) {
+        return b.setButtonText('测试视觉模型').onClick(function () {
+          plugin.testVision();
         });
       })
       .addButton(function (b) {

@@ -1,7 +1,7 @@
 {
   "id": "mobile-daily-note",
   "name": "剪贴板摘要",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "minAppVersion": "1.4.0",
   "description": "一键把剪贴板上的文字和图片整理成一篇带日期的 AI 总结笔记，手机端友好。",
   "author": "Codex",
