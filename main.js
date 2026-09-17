@@ -31,6 +31,7 @@ const DEFAULT_SETTINGS = {
   primaryAction: 'clipboard',
   chunkEnabled: true,
   chunkThreshold: 12000,
+  cleanupAfterSummary: false,
 };
 
 function pad(n) {
@@ -166,6 +167,26 @@ function splitText(text, size) {
   return out;
 }
 
+// 把指定图片的引用从笔记里去掉（避免删了文件留下断链）
+function stripImageEmbeds(content, paths) {
+  const wanted = new Set();
+  (paths || []).forEach(function (p) {
+    const clean = String(p).replace(/\\/g, '/');
+    wanted.add(clean);
+    wanted.add(clean.replace(/\.md$/i, ''));
+    wanted.add(clean.split('/').pop());
+  });
+  if (!wanted.size) return String(content == null ? '' : content);
+
+  return String(content == null ? '' : content)
+    .replace(/!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]\n?/g, function (m, target) {
+      const t = String(target).trim().replace(/\\/g, '/');
+      if (wanted.has(t) || wanted.has(t.split('/').pop())) return '';
+      return m;
+    })
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 // 把 lines 追加到指定小节末尾；找不到该节就在文末补一节。
 // 只按「已知的小节标题」判断边界，所以正文里出现 ## 之类的标题也不会干扰。
 function appendToSection(content, title, lines) {
@@ -210,6 +231,12 @@ class ClipboardSummaryPlugin extends Plugin {
       id: 'active-note-to-summary',
       name: '当前笔记生成 AI 总结（含笔记里的图片）',
       callback: () => this.runSource('activeNote'),
+    });
+
+    this.addCommand({
+      id: 'cleanup-last-images',
+      name: '清除最近一次总结用到的图片',
+      callback: () => this.cleanupLast(),
     });
 
     // 手机桌面图标 / 快捷指令可以直接用这个地址，无需打开命令面板
@@ -314,7 +341,7 @@ class ClipboardSummaryPlugin extends Plugin {
       if (!img) continue;
       try {
         const buf = await this.app.vault.readBinary(img);
-        images.push({ mime: this.mimeForPath(img.path), bytes: new Uint8Array(buf), name: img.name });
+        images.push({ mime: this.mimeForPath(img.path), bytes: new Uint8Array(buf), name: img.name, path: img.path });
       } catch (e) {
         // 读不出来就跳过这张
       }
@@ -626,6 +653,7 @@ class ClipboardSummaryPlugin extends Plugin {
   async createFromSource(source) {
     let text = '';
     let images = [];
+    let sourceNotePath = '';
 
     if (source === 'activeNote') {
       const note = await this.readActiveNote();
@@ -635,6 +663,7 @@ class ClipboardSummaryPlugin extends Plugin {
       }
       text = note.text;
       images = note.images;
+      sourceNotePath = note.file.path;
       if (!text && !images.length) {
         new Notice('这篇笔记里没有可总结的文字或图片。');
         return;
@@ -684,6 +713,21 @@ class ClipboardSummaryPlugin extends Plugin {
         if (imageLine >= 0) this.focusLine(file, imageLine + 2);
       }
       resultPath = path;
+    }
+
+    // 记录本次用到的图片和笔记，方便「总结后清理图片」
+    const runInfo = {
+      imagePaths: source === 'activeNote'
+        ? images.map(function (i) { return i.path; }).filter(Boolean)
+        : imagePaths.slice(),
+      notePaths: source === 'activeNote' ? [sourceNotePath] : [resultPath],
+    };
+    this._lastRun = runInfo;
+
+    // 只在总结确实产出了内容时才清理，避免把还没用上的图删掉
+    if (this.settings.cleanupAfterSummary && summary && !summaryError) {
+      const cleaned = await this.cleanupImages(runInfo);
+      if (cleaned) new Notice('已清理 ' + cleaned + ' 张图片（移到回收站，可恢复）', 5000);
     }
 
     if (summaryError) {
@@ -804,6 +848,65 @@ class ClipboardSummaryPlugin extends Plugin {
     } catch (e) {
       // 忽略
     }
+  }
+
+  // ----- 总结后清理图片（默认关，只清本次用到的，移到回收站）-----
+
+  async trashFile(file) {
+    const fm = this.app.fileManager;
+    if (fm && typeof fm.trashFile === 'function') {
+      await fm.trashFile(file);
+      return;
+    }
+    if (this.app.vault && typeof this.app.vault.trash === 'function') {
+      await this.app.vault.trash(file, true);
+      return;
+    }
+    await this.app.vault.delete(file, true);
+  }
+
+  async cleanupImages(info) {
+    if (!info || !info.imagePaths || !info.imagePaths.length) return 0;
+
+    // 1) 先把笔记里的图片引用去掉，避免留下断链
+    for (const p of info.notePaths || []) {
+      const note = this.app.vault.getAbstractFileByPath(p);
+      if (!(note instanceof TFile)) continue;
+      const paths = info.imagePaths;
+      try {
+        await this.app.vault.process(note, function (data) {
+          return stripImageEmbeds(data, paths);
+        });
+      } catch (e) {
+        // 单个笔记失败不影响其它
+      }
+    }
+
+    // 2) 再把图片文件移进回收站（可恢复）
+    let n = 0;
+    for (const p of info.imagePaths) {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) continue;
+      try {
+        await this.trashFile(f);
+        n++;
+      } catch (e) {
+        // 忽略单张失败
+      }
+    }
+    return n;
+  }
+
+  cleanupLast() {
+    const info = this._lastRun;
+    if (!info || !info.imagePaths || !info.imagePaths.length) {
+      new Notice('还没有可清理的图片（本次总结没用过图片）');
+      return;
+    }
+    return this.cleanupImages(info).then((n) => {
+      new Notice('已清理 ' + n + ' 张图片（移到回收站，可恢复）', 6000);
+      this._lastRun = null;
+    });
   }
 }
 
@@ -1009,6 +1112,16 @@ class ClipboardSummarySettingTab extends PluginSettingTab {
       .addToggle(function (tg) {
         return tg.setValue(!!s.saveOriginal).onChange(async function (v) {
           s.saveOriginal = v;
+          await plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('总结后清理图片')
+      .setDesc('总结成功后，把本次用到的图片移出笔记并放进 Obsidian 回收站（可恢复）。默认关闭；命令面板里还有「清除最近一次总结用到的图片」可手动清')
+      .addToggle(function (tg) {
+        return tg.setValue(!!s.cleanupAfterSummary).onChange(async function (v) {
+          s.cleanupAfterSummary = v;
           await plugin.saveSettings();
         });
       });
